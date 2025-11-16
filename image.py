@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-BUCKET_URL = "https://wvita-image-attachments-development.zohostratus.in"
+BUCKET_URL = os.getenv("BUCKET_URL")
 ACCESS_TOKEN = os.getenv("CATALYST_TOKEN")  # Your Zoho OAuth token
 
 def upload_to_stratus():
