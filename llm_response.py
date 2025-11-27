@@ -3,11 +3,11 @@ import requests
 from dotenv import load_dotenv
 load_dotenv()
 
-PROJECT_ID = os.getenv("PROJECT_ID")          # your project id
-ORG_ID = os.getenv("ORG_ID")                    # your org id
+PROJECT_ID = os.getenv("CATALYST_PROJECT_ID")          # your project id
+ORG_ID = os.getenv("CATALYST_ORG_ID")                    # your org id
 ACCESS_TOKEN = os.getenv("CATALYST_TOKEN")  # put your OAuth/Zoho access token in env
 
-url = f"https://api.catalyst.zoho.in/quickml/v2/project/{PROJECT_ID}/llm/chat"
+url = f"https://api.catalyst.zoho.com/quickml/v2/project/{PROJECT_ID}/llm/chat"
 
 headers = {
     "Content-Type": "application/json",

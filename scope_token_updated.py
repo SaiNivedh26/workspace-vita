@@ -12,12 +12,13 @@ CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 REDIRECT_URI = "http://localhost:9000/oauth/callback"
 
-ACCOUNTS_BASE = "https://accounts.zoho.in"
+ACCOUNTS_BASE = "https://accounts.zoho.com"
 AUTH_URL = f"{ACCOUNTS_BASE}/oauth/v2/auth"
 TOKEN_URL = f"{ACCOUNTS_BASE}/oauth/v2/token"
 
 # CORRECT SCOPE for OCR from the docs: ZohoCatalyst.mlkit.READ
-SCOPE = "QuickML.deployment.READ,ZohoCatalyst.mlkit.READ,ZohoProfile.userinfo.read,ZohoCatalyst.buckets.READ,Stratus.fileop.CREATE"
+SCOPE = "QuickML.deployment.READ,ZohoCatalyst.mlkit.READ,ZohoProfile.userinfo.read,ZohoCatalyst.buckets.READ,Stratus.fileop.CREATE,ZohoCatalyst.tables.rows.CREATE,ZohoCatalyst.tables.rows.READ,ZohoCatalyst.tables.rows.UPDATE,ZohoCatalyst.tables.READ,ZohoCatalyst.tables.READ,ZohoCatalyst.tables.columns.READ,ZohoCatalyst.tables.columns.READ"
+
 
 ORG_ID = os.getenv("ORG_ID")
 PROJECT_ID = os.getenv("PROJECT_ID")

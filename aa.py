@@ -14,8 +14,8 @@ CLIENT_ID = os.getenv('CLIENT_ID')
 CLIENT_SECRET = os.getenv('CLIENT_SECRET')
 
 REDIRECT_URI = 'http://localhost:8000/oauth/callback'  # Must match Zoho developer console
-AUTH_URL = 'https://accounts.zoho.in/oauth/v2/auth'
-TOKEN_URL = 'https://accounts.zoho.in/oauth/v2/token'
+AUTH_URL = 'https://accounts.zoho.com/oauth/v2/auth'
+TOKEN_URL = 'https://accounts.zoho.com/oauth/v2/token'
 SCOPE = 'ZohoCliq.Channels.READ ZohoCliq.Messages.READ ZohoCliq.Messages.CREATE'
 
 ACCESS_TOKEN = None

@@ -11,7 +11,7 @@ def run_ocr():
     if not ACCESS_TOKEN:
         raise RuntimeError("Set CATALYST_TOKEN env var to a valid Zoho OAuth token")
 
-    url = f"https://api.catalyst.zoho.in/baas/v1/project/{PROJECT_ID}/ml/ocr"
+    url = f"https://api.catalyst.zoho.com/baas/v1/project/{PROJECT_ID}/ml/ocr"
 
     headers = {
         # Use Zoho-oauthtoken, same as curl example
