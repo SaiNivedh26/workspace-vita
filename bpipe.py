@@ -155,6 +155,58 @@ open_issues = {}  # {issue_id: {"opened_at": ts, "title": str, "category": str, 
 #         traceback.print_exc()
 #         return {"role": "discussion", "category": "other", "severity": "low"}
 
+
+def get_issue_id_from_last_message(conversation_id: str):
+    """Get issue_id from the most recent message in this conversation"""
+    if not (CATALYST_TOKEN and CATALYST_PROJECT_ID):
+        return None
+
+    url = f"https://api.catalyst.zoho.com/baas/v1/project/{CATALYST_PROJECT_ID}/table/{CONVERSATIONS_TABLE}/row"
+    headers = {
+        "Authorization": f"Zoho-oauthtoken {CATALYST_TOKEN}",
+        "CATALYST-ORG": CATALYST_ORG_ID,
+    }
+
+    try:
+        # Fetch messages for this conversation
+        resp = requests.get(f"{url}?max_rows=100", headers=headers, timeout=10)
+        if resp.status_code != 200:
+            return None
+        
+        rows = resp.json().get("data", [])
+        
+        # Filter by conversation_id
+        conv_messages = [r for r in rows if r.get("conversation_id") == conversation_id]
+        
+        if not conv_messages:
+            print(f"❌ No previous messages in conversation {conversation_id}")
+            return None
+        
+        # Sort by timestamp descending (newest first)
+        conv_messages.sort(key=lambda r: int(r.get("time_stamp", 0)), reverse=True)
+        
+        # Get issue_id from most recent message
+        for msg in conv_messages:
+            issue_id = msg.get("issue_id")
+            if issue_id and issue_id != "":
+                print(f"📎 Found issue_id from previous message: {issue_id[:12]}")
+                return issue_id
+        
+        print(f"❌ No issue_id found in previous messages")
+        return None
+        
+    except Exception as e:
+        print(f"❌ get_issue_id_from_last_message exception: {e}")
+        return None
+
+
+
+
+
+
+
+
+
 def classify_message_llm(text: str) -> dict:
     url = f"https://api.catalyst.zoho.com/quickml/v2/project/{CATALYST_PROJECT_ID}/llm/chat"
     headers = {
@@ -989,20 +1041,40 @@ def find_similar_open_incident(message_emb, threshold=0.75):
 #     return (None, 0)
 
 
-def summarize_resolution_with_llm(messages: list) -> str:
-    """
-    Use LLM to generate resolution summary from all linked messages.
-    """
-    if not messages:
+def summarize_resolution_with_llm(messages: list, current_resolution_text: str = None) -> str:
+    """Generate resolution summary using same pattern as classification"""
+    if not messages and not current_resolution_text:
         return "No resolution details available."
     
-    # Collect resolution and discussion messages
-    relevant = [m for m in messages if m.get("role") in ["resolution", "discussion"]]
+    # Get relevant messages
+    relevant = [m for m in messages if m.get("role") in ["incident", "discussion", "resolution"]]
+    
+    # Add current resolution if provided
+    if current_resolution_text:
+        relevant.append({
+            "role": "resolution",
+            "message_text": current_resolution_text
+        })
+    
     if not relevant:
         return "Issue resolved (no details recorded)."
     
-    text_concat = "\n".join([m.get("message_text", "") for m in relevant[:10]])
+    # Extract components
+    incident = next((m.get("message_text", "") for m in relevant if m.get("role") == "incident"), "")
+    discussions = [m.get("message_text", "") for m in relevant if m.get("role") == "discussion"][:3]
+    resolutions = [m.get("message_text", "") for m in relevant if m.get("role") == "resolution"]
     
+    if not resolutions:
+        return "Resolved (no resolution message recorded)."
+    
+    # Build context (limit to avoid errors)
+    incident_text = incident[:100] if incident else "Unknown issue"
+    discussion_text = "; ".join(discussions)[:150] if discussions else "No investigation notes"
+    resolution_text = "; ".join(resolutions)[:150]
+    
+    print(f"📝 Summary components: incident={len(incident_text)} chars, discussions={len(discussion_text)} chars, resolutions={len(resolution_text)} chars")
+    
+    # ✅ SAME URL AND HEADERS AS CLASSIFICATION
     url = f"https://api.catalyst.zoho.com/quickml/v2/project/{CATALYST_PROJECT_ID}/llm/chat"
     headers = {
         "Content-Type": "application/json",
@@ -1010,30 +1082,269 @@ def summarize_resolution_with_llm(messages: list) -> str:
         "CATALYST-ORG": CATALYST_ORG_ID,
     }
     
-    prompt = f"""Summarize how this incident was resolved based on these messages:
+    # ✅ SIMILAR PROMPT STRUCTURE TO CLASSIFICATION
+    prompt = f"""Summarize this incident resolution in 1-2 sentences.
 
-{text_concat}
+Problem: "{incident_text}"
 
-Provide a concise 2-3 sentence summary of the resolution."""
+Investigation: "{discussion_text}"
 
+Resolution: "{resolution_text}"
+
+Provide a concise summary of how the issue was resolved (what was done and the outcome).
+
+Summary:"""
+    
+    # ✅ SAME DATA STRUCTURE AS CLASSIFICATION
     data = {
         "prompt": prompt,
         "model": "crm-di-qwen_text_14b-fp8-it",
-        "system_prompt": "You summarize incident resolutions clearly and concisely.",
-        "temperature": 0.5,
-        "max_tokens": 256,
+        "system_prompt": "You summarize incident resolutions clearly. Describe what was done to fix the problem and the outcome in 1-2 sentences.",
+        "top_p": 0.8,
+        "top_k": 40,
+        "best_of": 1,
+        "temperature": 0.3,
+        "max_tokens": 150,
     }
     
     try:
         resp = requests.post(url, json=data, headers=headers, timeout=30)
-        if resp.status_code == 200:
-            result = resp.json()
-            summary = result.get("data", {}).get("output_text", "").strip()
-            return summary if summary else "Resolution details unavailable."
+        print(f"LLM Summary Status: {resp.status_code}")
+        
+        if resp.status_code != 200:
+            print(f"LLM Summary Error Response: {resp.text[:200]}")
+            # Fallback to resolution text
+            return resolution_text
+        
+        result = resp.json()
+        print(f"LLM Summary Full Response: {json.dumps(result, indent=2)}")
+        
+        # ✅ SAME RESPONSE PARSING AS CLASSIFICATION
+        output_text = None
+        
+        # Path 1: data.output_text
+        if "data" in result and "output_text" in result["data"]:
+            output_text = result["data"]["output_text"]
+        
+        # Path 2: direct output_text
+        elif "output_text" in result:
+            output_text = result["output_text"]
+        
+        # Path 3: response
+        elif "response" in result:
+            output_text = result["response"]
+        
+        print(f"Extracted summary output_text: {output_text}")
+        
+        if not output_text:
+            print("No output_text found in summary response")
+            return resolution_text
+        
+        # Clean the output
+        summary = output_text.strip()
+        
+        # Remove any leading/trailing quotes or markdown
+        if summary.startswith('"') and summary.endswith('"'):
+            summary = summary[1:-1]
+        
+        if len(summary) > 10:
+            print(f"✅ Parsed summary: {summary[:100]}...")
+            return summary
+        else:
+            print(f"⚠️ Summary too short, using fallback")
+            return resolution_text
+        
+    except json.JSONDecodeError as e:
+        print(f"JSON parse error in summary: {e}")
+        return resolution_text
     except Exception as e:
-        print(f"LLM summarization error: {e}")
+        print(f"LLM summary exception: {e}")
+        import traceback
+        traceback.print_exc()
+        return resolution_text
+
+# def summarize_resolution_with_llm(messages: list, current_resolution_text: str = None) -> str:
+#     """Generate resolution summary from linked messages + current resolution"""
+#     if not messages and not current_resolution_text:
+#         return "No resolution details available."
     
-    return "Resolution completed (summary unavailable)."
+#     # Get incident + discussion + resolution messages
+#     relevant = [m for m in messages if m.get("role") in ["incident", "discussion", "resolution"]]
+    
+#     # Add current resolution if provided
+#     if current_resolution_text:
+#         relevant.append({
+#             "role": "resolution",
+#             "message_text": current_resolution_text
+#         })
+    
+#     if not relevant:
+#         return "Issue resolved (no details recorded)."
+    
+#     # Build CONCISE context
+#     incident = next((m.get("message_text", "") for m in relevant if m.get("role") == "incident"), "")
+#     resolutions = [m.get("message_text", "") for m in relevant if m.get("role") == "resolution"]
+    
+#     if not resolutions:
+#         return "Resolved (no resolution message recorded)."
+    
+#     # ✅ SHORTER context to avoid 400 error
+#     context = f"{incident[:100]} → {'; '.join(resolutions)[:150]}"
+    
+#     print(f"📝 LLM context: {context[:120]}...")
+    
+#     url = f"https://api.catalyst.zoho.com/quickml/v2/project/{CATALYST_PROJECT_ID}/llm/chat"
+#     headers = {
+#         "Content-Type": "application/json",
+#         "Authorization": f"Bearer {CATALYST_TOKEN}",
+#         "CATALYST-ORG": CATALYST_ORG_ID
+#     }
+    
+#     # ✅ SHORTER prompt
+#     prompt = f"""Summarize: {context}"""
+    
+#     data = {
+#         "prompt": prompt,
+#         "model": "crm-di-qwen_text_14b-fp8-it",
+#         "system_prompt": "Summarize incident resolution in 1 sentence: what was done.",
+#         "temperature": 0.3,
+#         "max_tokens": 100,
+#     }
+    
+#     try:
+#         resp = requests.post(url, json=data, headers=headers, timeout=30)
+#         print(f"🤖 LLM response status: {resp.status_code}")
+        
+#         if resp.status_code == 200:
+#             result = resp.json()
+#             output = result.get("data", {}).get("output_text") or result.get("response", "")
+#             summary = output.strip()
+            
+#             if summary and len(summary) > 10:
+#                 print(f"✅ LLM summary: {summary[:80]}...")
+#                 return summary
+#         else:
+#             print(f"❌ LLM error: {resp.text[:200]}")
+        
+#         # Fallback
+#         fallback = resolutions[0][:150] if resolutions else "Resolved"
+#         print(f"📝 Fallback: {fallback[:80]}...")
+#         return fallback
+        
+#     except Exception as e:
+#         print(f"❌ LLM exception: {e}")
+#         return resolutions[0][:150] if resolutions else "Resolved"
+
+
+# def summarize_resolution_with_llm(messages: list) -> str:
+#     """Generate resolution summary from linked messages"""
+#     if not messages:
+#         return "No resolution details available."
+    
+#     # Get incident + discussion + resolution messages
+#     relevant = [m for m in messages if m.get("role") in ["incident", "discussion", "resolution"]]
+#     if not relevant:
+#         return "Issue resolved (no details recorded)."
+    
+#     # Build context
+#     incident = next((m.get("message_text", "") for m in relevant if m.get("role") == "incident"), "")
+#     discussions = [m.get("message_text", "") for m in relevant if m.get("role") == "discussion"][:5]
+#     resolutions = [m.get("message_text", "") for m in relevant if m.get("role") == "resolution"]
+    
+#     if not resolutions:
+#         return "Resolved (no resolution message recorded)."
+    
+#     context = f"Problem: {incident}\n"
+#     if discussions:
+#         context += f"Investigation: {'; '.join(discussions)}\n"
+#     context += f"Resolution: {'; '.join(resolutions)}"
+    
+#     url = f"https://api.catalyst.zoho.com/quickml/v2/project/{CATALYST_PROJECT_ID}/llm/chat"
+#     headers = {
+#         "Content-Type": "application/json",
+#         "Authorization": f"Bearer {CATALYST_TOKEN}",
+#         "CATALYST-ORG": CATALYST_ORG_ID
+#     }
+    
+#     prompt = f"""Summarize how this incident was resolved in 1-2 sentences:
+
+# {context}
+
+# Summary:"""
+    
+#     data = {
+#         "prompt": prompt,
+#         "model": "crm-di-qwen_text_14b-fp8-it",
+#         "system_prompt": "Summarize incident resolutions clearly: what was done and the outcome.",
+#         "temperature": 0.3,
+#         "max_tokens": 150,
+#     }
+    
+#     try:
+#         resp = requests.post(url, json=data, headers=headers, timeout=30)
+#         if resp.status_code == 200:
+#             result = resp.json()
+#             output = result.get("data", {}).get("output_text") or result.get("response", "")
+#             summary = output.strip()
+            
+#             if summary and len(summary) > 10:
+#                 print(f"✅ LLM summary: {summary[:50]}...")
+#                 return summary
+        
+#         print(f"⚠️ LLM failed, using fallback")
+#         # Fallback: just use resolution messages
+#         return "; ".join(resolutions)[:200]
+        
+#     except Exception as e:
+#         print(f"❌ LLM error: {e}")
+#         return "; ".join(resolutions)[:200] if resolutions else "Resolved"
+
+
+# def summarize_resolution_with_llm(messages: list) -> str:
+#     """
+#     Use LLM to generate resolution summary from all linked messages.
+#     """
+#     if not messages:
+#         return "No resolution details available."
+    
+#     # Collect resolution and discussion messages
+#     relevant = [m for m in messages if m.get("role") in ["resolution", "discussion"]]
+#     if not relevant:
+#         return "Issue resolved (no details recorded)."
+    
+#     text_concat = "\n".join([m.get("message_text", "") for m in relevant[:10]])
+    
+#     url = f"https://api.catalyst.zoho.com/quickml/v2/project/{CATALYST_PROJECT_ID}/llm/chat"
+#     headers = {
+#         "Content-Type": "application/json",
+#         "Authorization": f"Bearer {CATALYST_TOKEN}",
+#         "CATALYST-ORG": CATALYST_ORG_ID,
+#     }
+    
+#     prompt = f"""Summarize how this incident was resolved based on these messages:
+
+# {text_concat}
+
+# Provide a concise 2-3 sentence summary of the resolution."""
+
+#     data = {
+#         "prompt": prompt,
+#         "model": "crm-di-qwen_text_14b-fp8-it",
+#         "system_prompt": "You summarize incident resolutions clearly and concisely.",
+#         "temperature": 0.5,
+#         "max_tokens": 256,
+#     }
+    
+#     try:
+#         resp = requests.post(url, json=data, headers=headers, timeout=30)
+#         if resp.status_code == 200:
+#             result = resp.json()
+#             summary = result.get("data", {}).get("output_text", "").strip()
+#             return summary if summary else "Resolution details unavailable."
+#     except Exception as e:
+#         print(f"LLM summarization error: {e}")
+    
+#     return "Resolution completed (summary unavailable)."
 
 
 # ---------- Main Indexing Pipeline ----------
@@ -1059,18 +1370,81 @@ def index_message(conversation_id, message_id, sender_id, timestamp_ms, message_
     issue_id = None
     
     # 3. Link to issue
-    if role == "incident":
-        # Check for duplicate title
-        existing_open = fetch_open_issues()
-        normalized_title = message_text.strip().lower()
-        for row in existing_open:
-            if row.get("title", "").strip().lower() == normalized_title:
-                issue_id = row.get("issue_id")
-                print(f"🔗 Reusing existing open issue for same title: {issue_id}")
-                break
+    # if role == "incident":
+    #     # Check for duplicate title
+    #     existing_open = fetch_open_issues()
+    #     normalized_title = message_text.strip().lower()
+    #     for row in existing_open:
+    #         if row.get("title", "").strip().lower() == normalized_title:
+    #             issue_id = row.get("issue_id")
+    #             print(f"🔗 Reusing existing open issue for same title: {issue_id}")
+    #             break
         
-        # If not found, try similarity
+    #     # If not found, try similarity
+    #     if not issue_id:
+    #         q_filter = Filter(must=[FieldCondition(key="role", match=MatchValue(value="incident"))])
+    #         hits = qdrant.search(
+    #             collection_name=QDRANT_COLLECTION,
+    #             query_vector=emb,
+    #             query_filter=q_filter,
+    #             limit=5,
+    #         )
+    #         open_ids = {r.get("issue_id") for r in existing_open if r.get("issue_id")}
+    #         best_issue_id = None
+    #         best_score = 0.0
+    #         for h in hits:
+    #             if not h.payload:
+    #                 continue
+    #             cand_id = h.payload.get("issue_id")
+    #             if not cand_id or cand_id not in open_ids:
+    #                 continue
+    #             if h.score > best_score and h.score >= 0.75:
+    #                 best_issue_id = cand_id
+    #                 best_score = h.score
+    #         if best_issue_id:
+    #             issue_id = best_issue_id
+    #             print(f"🔗 Linked incident to similar open issue: {issue_id} (score={best_score:.2f})")
+        
+    #     # Create new issue if still no match
+    #     if not issue_id:
+    #         issue_id = str(uuid.uuid4())
+    #         title = message_text[:100] + ("..." if len(message_text) > 100 else "")
+    #         create_issue_in_datastore(issue_id, title, "Cliq", category, severity, timestamp_ms)
+    #         print(f"🆕 Created new issue: {issue_id}")
+
+    if role == "incident":
+        # ✅ Check for duplicate title (including RECENTLY CLOSED ones)
+        all_issues = fetch_all_issues()  # Get ALL issues (open + resolved)
+        normalized_title = message_text.strip().lower()
+        
+        # Check last 5 issues (including recently closed)
+        for row in all_issues[:5]:
+            existing_title = row.get("title", "").strip().lower()
+            existing_status = row.get("status", "").lower()
+            
+            if existing_title == normalized_title:
+                # Check if recently closed (within 5 minutes)
+                resolved_ts = int(row.get("resolved_at", 0))
+                if resolved_ts > 0:
+                    time_diff_ms = timestamp_ms - resolved_ts
+                    time_diff_minutes = time_diff_ms / (1000 * 60)
+                    
+                    if time_diff_minutes < 5:
+                        print(f"⚠️ Skipping duplicate incident - same title closed {time_diff_minutes:.1f} minutes ago")
+                        # Link to the closed issue instead of creating new one
+                        issue_id = row.get("issue_id")
+                        print(f"🔗 Linking to recently closed issue: {issue_id[:12]}")
+                        break
+                
+                # If open, reuse it
+                if existing_status == "open":
+                    issue_id = row.get("issue_id")
+                    print(f"🔗 Reusing existing open issue: {issue_id}")
+                    break
+        
+        # If not found, try similarity (only for open issues)
         if not issue_id:
+            existing_open = fetch_open_issues()
             q_filter = Filter(must=[FieldCondition(key="role", match=MatchValue(value="incident"))])
             hits = qdrant.search(
                 collection_name=QDRANT_COLLECTION,
@@ -1100,25 +1474,96 @@ def index_message(conversation_id, message_id, sender_id, timestamp_ms, message_
             title = message_text[:100] + ("..." if len(message_text) > 100 else "")
             create_issue_in_datastore(issue_id, title, "Cliq", category, severity, timestamp_ms)
             print(f"🆕 Created new issue: {issue_id}")
+
     
+    # elif role in ["discussion", "resolution"]:
+    #     # Link to latest open issue
+    #     latest_open = get_latest_open_issue_for_conversation(conversation_id)
+    #     if latest_open:
+    #         issue_id = latest_open.get("issue_id")
+    #         print(f"🔗 Linked {role} to latest open issue: {issue_id}")
+    #     else:
+    #         print(f"No open issue in DS for conversation {conversation_id}; {role} unlinked.")
+        
+    #     # If resolution, close issue
+    #     if role == "resolution" and issue_id:
+    #         messages = fetch_messages_by_issue_id(issue_id)
+    #         summary = summarize_resolution_with_llm(messages)
+    #         ok = store_resolution_summary(issue_id, summary, timestamp_ms)
+    #         if ok:
+    #             print(f"✅ Closed issue with summary: {issue_id}")
+    #         else:
+    #             print(f"❌ Failed to store resolution summary: {issue_id}")
+
+    # elif role in ["discussion", "resolution"]:
+    #     # Try to link to latest open issue
+    #     latest_open = get_latest_open_issue_for_conversation(conversation_id)
+    #     if latest_open:
+    #         issue_id = latest_open.get("issue_id")
+    #         print(f"🔗 Linked {role} to latest open issue: {issue_id}")
+    #     else:
+    #         # ✅ FALLBACK: Get issue_id from previous message in this conversation
+    #         print(f"⚠️ No open issue found, checking previous messages...")
+    #         issue_id = get_issue_id_from_last_message(conversation_id)
+            
+    #         if issue_id:
+    #             print(f"🔗 Linked {role} to issue from previous message: {issue_id[:12]}")
+    #         else:
+    #             print(f"❌ No issue_id found; {role} unlinked.")
+        
+    #     # ✅ IF RESOLUTION: Generate summary and close issue
+    #     if role == "resolution" and issue_id:
+    #         print(f"🔧 Processing resolution for issue {issue_id[:12]}...")
+            
+    #         # Fetch all messages for this issue
+    #         messages = fetch_messages_by_issue_id(issue_id)
+    #         print(f"📥 Found {len(messages)} messages for summary generation")
+            
+    #         # Generate summary
+    #         summary = summarize_resolution_with_llm(messages)
+    #         print(f"✅ Generated summary: {summary[:80]}...")
+            
+    #         # Store summary and close issue
+    #         ok = store_resolution_summary(issue_id, summary, timestamp_ms)
+    #         if ok:
+    #             print(f"✅ Closed issue {issue_id[:12]} with summary")
+    #         else:
+    #             print(f"❌ Failed to close issue {issue_id[:12]}")
     elif role in ["discussion", "resolution"]:
-        # Link to latest open issue
+        # Try to link to latest open issue
         latest_open = get_latest_open_issue_for_conversation(conversation_id)
         if latest_open:
             issue_id = latest_open.get("issue_id")
             print(f"🔗 Linked {role} to latest open issue: {issue_id}")
         else:
-            print(f"No open issue in DS for conversation {conversation_id}; {role} unlinked.")
+            # Fallback: Get issue_id from previous message
+            print(f"⚠️ No open issue found, checking previous messages...")
+            issue_id = get_issue_id_from_last_message(conversation_id)
+            
+            if issue_id:
+                print(f"🔗 Linked {role} to issue from previous message: {issue_id[:12]}")
+            else:
+                print(f"❌ No issue_id found; {role} unlinked.")
         
-        # If resolution, close issue
+        # IF RESOLUTION: Generate summary and close issue
         if role == "resolution" and issue_id:
+            print(f"🔧 Processing resolution for issue {issue_id[:12]}...")
+            
+            # Fetch existing messages
             messages = fetch_messages_by_issue_id(issue_id)
-            summary = summarize_resolution_with_llm(messages)
+            print(f"📥 Found {len(messages)} existing messages for summary")
+            
+            # ✅ Generate summary INCLUDING current resolution message
+            summary = summarize_resolution_with_llm(messages, current_resolution_text=message_text)
+            print(f"✅ Generated summary: {summary[:100]}...")
+            
+            # Store summary and close issue
             ok = store_resolution_summary(issue_id, summary, timestamp_ms)
             if ok:
-                print(f"✅ Closed issue with summary: {issue_id}")
+                print(f"✅ Closed issue {issue_id[:12]} with summary")
             else:
-                print(f"❌ Failed to store resolution summary: {issue_id}")
+                print(f"❌ Failed to close issue {issue_id[:12]}")
+
     
     # ✅ 4. Store in Data Store (ALWAYS, for ALL roles)
     row_id = insert_message_into_datastore(
@@ -1890,6 +2335,7 @@ def issue_conversations_json():
     return jsonify({"messages": out})
 
 
+
 @app.route('/search_incidents_card_json', methods=['GET'])
 def search_incidents_card_json():
     query = request.args.get("query", "").strip()
@@ -1900,19 +2346,14 @@ def search_incidents_card_json():
     print(f"🔍 SEARCH QUERY: '{query}'")
     print(f"{'='*60}")
     
-    # Embed & search incidents
     q_emb = embed_text(query)
-    print(f"✅ Embedded query (vector size: {len(q_emb)})")
-    
     q_filter = Filter(must=[FieldCondition(key="role", match=MatchValue(value="incident"))])
     
-    # ✅ LOWER THRESHOLD AND INCREASE LIMIT
     hits = qdrant.search(
         collection_name=QDRANT_COLLECTION, 
         query_vector=q_emb, 
         query_filter=q_filter, 
-        limit=20,  # More results
-        score_threshold=0.3  # ✅ Lower threshold (30% match)
+        limit=20,
     )
     
     print(f"📊 Qdrant returned {len(hits)} hits")
@@ -1923,70 +2364,163 @@ def search_incidents_card_json():
             issue_id = hit.payload.get("issue_id", "N/A")[:12]
             score = hit.score
             print(f"  #{i}: score={score:.3f} | issue_id={issue_id}")
-    else:
-        print("❌ NO HITS FOUND!")
-        # Debug: Try searching WITHOUT filter to see if ANY results exist
-        all_hits = qdrant.search(
-            collection_name=QDRANT_COLLECTION,
-            query_vector=q_emb,
-            limit=5
-        )
-        print(f"🔍 Search without filter found {len(all_hits)} results:")
-        for hit in all_hits:
-            print(f"  - role={hit.payload.get('role')}, score={hit.score:.3f}")
     
     if not hits:
         return jsonify({"results": [], "count": 0})
     
-    # Get scored issue_ids (closest matches first)
     issue_scores = {}
     for hit in hits:
         if hit.payload and (iid := hit.payload.get("issue_id")):
             issue_scores.setdefault(iid, 0)
             issue_scores[iid] = max(issue_scores[iid], hit.score)
     
-    print(f"\n📋 Unique issues found: {len(issue_scores)}")
-    
-    # Fetch ALL issues & match scored ones
     all_issues = fetch_all_issues()
-    print(f"✅ Fetched {len(all_issues)} total issues from DataStore")
-    
     results = []
     
     for issue_id, score in sorted(issue_scores.items(), key=lambda x: x[1], reverse=True)[:5]:
         issue = next((i for i in all_issues if i.get("issue_id") == issue_id), None)
         if not issue:
-            print(f"⚠️ Issue {issue_id[:12]} found in Qdrant but NOT in DataStore!")
             continue
         
         # Dates
         opened_ts = int(issue.get("opened_at", 0))
         opened_str = datetime.fromtimestamp(opened_ts/1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M") if opened_ts else "N/A"
-        resolved_ts = int(issue.get("resolved_at", 0))
-        resolved_str = datetime.fromtimestamp(resolved_ts/1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M") if resolved_ts else "Open"
         
-        # Resolution summary
-        resolution_summary = issue.get("resolution_summary", "No resolution recorded")
-        if issue.get("status", "").lower() == "open":
+        resolved_ts = int(issue.get("resolved_at", 0))
+        status = issue.get("status", "Open")
+        
+        # ✅ Properly format resolved date
+        if resolved_ts > 0 and status.lower() == "resolved":
+            resolved_str = datetime.fromtimestamp(resolved_ts/1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+        else:
+            resolved_str = "—"
+        
+        # ✅ Get resolution summary (or generate if missing)
+        resolution_summary = issue.get("resolution_summary", "")
+        
+        if status.lower() == "resolved" and not resolution_summary:
+            # Generate summary now if missing
+            messages = fetch_messages_by_issue_id(issue_id)
+            resolution_summary = summarize_resolution_with_llm(messages)
+            print(f"🔧 Generated missing summary for {issue_id[:12]}: {resolution_summary[:50]}")
+        elif status.lower() == "open":
             resolution_summary = "🟡 Open - No resolution yet"
+        elif not resolution_summary:
+            resolution_summary = "No resolution recorded"
         
         results.append({
+            "issue_id": issue_id,  # ✅ Include full issue_id for buttons
             "title": issue.get("title", "Untitled")[:80],
-            "status": issue.get("status", "Open"),
+            "status": status,
             "category": issue.get("category", "other"),
             "severity": issue.get("severity", "low"),
             "opened_at": opened_str,
-            "resolved_at": resolved_str,
+            "resolved_at": resolved_str,  # ✅ Now shows actual date
             "resolution_summary": resolution_summary[:150],
             "score": round(score, 2)
         })
-        
-        print(f"✅ Added result: {issue.get('title', '')[:50]} (score={score:.2f})")
     
     print(f"\n✅ RETURNING {len(results)} results")
-    print(f"{'='*60}\n")
-    
     return jsonify({"results": results, "count": len(results)})
+
+
+# @app.route('/search_incidents_card_json', methods=['GET'])
+# def search_incidents_card_json():
+#     query = request.args.get("query", "").strip()
+#     if not query:
+#         return jsonify({"results": [], "count": 0})
+    
+#     print(f"\n{'='*60}")
+#     print(f"🔍 SEARCH QUERY: '{query}'")
+#     print(f"{'='*60}")
+    
+#     # Embed & search incidents
+#     q_emb = embed_text(query)
+#     print(f"✅ Embedded query (vector size: {len(q_emb)})")
+    
+#     q_filter = Filter(must=[FieldCondition(key="role", match=MatchValue(value="incident"))])
+    
+#     # ✅ LOWER THRESHOLD AND INCREASE LIMIT
+#     hits = qdrant.search(
+#         collection_name=QDRANT_COLLECTION, 
+#         query_vector=q_emb, 
+#         query_filter=q_filter, 
+#         limit=20,  # More results
+#         score_threshold=0.3  # ✅ Lower threshold (30% match)
+#     )
+    
+#     print(f"📊 Qdrant returned {len(hits)} hits")
+    
+#     if hits:
+#         print(f"\n🎯 TOP MATCHES:")
+#         for i, hit in enumerate(hits[:5], 1):
+#             issue_id = hit.payload.get("issue_id", "N/A")[:12]
+#             score = hit.score
+#             print(f"  #{i}: score={score:.3f} | issue_id={issue_id}")
+#     else:
+#         print("❌ NO HITS FOUND!")
+#         # Debug: Try searching WITHOUT filter to see if ANY results exist
+#         all_hits = qdrant.search(
+#             collection_name=QDRANT_COLLECTION,
+#             query_vector=q_emb,
+#             limit=5
+#         )
+#         print(f"🔍 Search without filter found {len(all_hits)} results:")
+#         for hit in all_hits:
+#             print(f"  - role={hit.payload.get('role')}, score={hit.score:.3f}")
+    
+#     if not hits:
+#         return jsonify({"results": [], "count": 0})
+    
+#     # Get scored issue_ids (closest matches first)
+#     issue_scores = {}
+#     for hit in hits:
+#         if hit.payload and (iid := hit.payload.get("issue_id")):
+#             issue_scores.setdefault(iid, 0)
+#             issue_scores[iid] = max(issue_scores[iid], hit.score)
+    
+#     print(f"\n📋 Unique issues found: {len(issue_scores)}")
+    
+#     # Fetch ALL issues & match scored ones
+#     all_issues = fetch_all_issues()
+#     print(f"✅ Fetched {len(all_issues)} total issues from DataStore")
+    
+#     results = []
+    
+#     for issue_id, score in sorted(issue_scores.items(), key=lambda x: x[1], reverse=True)[:5]:
+#         issue = next((i for i in all_issues if i.get("issue_id") == issue_id), None)
+#         if not issue:
+#             print(f"⚠️ Issue {issue_id[:12]} found in Qdrant but NOT in DataStore!")
+#             continue
+        
+#         # Dates
+#         opened_ts = int(issue.get("opened_at", 0))
+#         opened_str = datetime.fromtimestamp(opened_ts/1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M") if opened_ts else "N/A"
+#         resolved_ts = int(issue.get("resolved_at", 0))
+#         resolved_str = datetime.fromtimestamp(resolved_ts/1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M") if resolved_ts else "Open"
+        
+#         # Resolution summary
+#         resolution_summary = issue.get("resolution_summary", "No resolution recorded")
+#         if issue.get("status", "").lower() == "open":
+#             resolution_summary = "🟡 Open - No resolution yet"
+        
+#         results.append({
+#             "title": issue.get("title", "Untitled")[:80],
+#             "status": issue.get("status", "Open"),
+#             "category": issue.get("category", "other"),
+#             "severity": issue.get("severity", "low"),
+#             "opened_at": opened_str,
+#             "resolved_at": resolved_str,
+#             "resolution_summary": resolution_summary[:150],
+#             "score": round(score, 2)
+#         })
+        
+#         print(f"✅ Added result: {issue.get('title', '')[:50]} (score={score:.2f})")
+    
+#     print(f"\n✅ RETURNING {len(results)} results")
+#     print(f"{'='*60}\n")
+    
+#     return jsonify({"results": results, "count": len(results)})
 
 
 # @app.route('/search_incidents_card_json', methods=['GET'])
