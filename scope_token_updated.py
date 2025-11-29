@@ -17,7 +17,7 @@ AUTH_URL = f"{ACCOUNTS_BASE}/oauth/v2/auth"
 TOKEN_URL = f"{ACCOUNTS_BASE}/oauth/v2/token"
 
 # CORRECT SCOPE for OCR from the docs: ZohoCatalyst.mlkit.READ
-SCOPE = "QuickML.deployment.READ,ZohoCatalyst.mlkit.READ,ZohoProfile.userinfo.read,ZohoCatalyst.buckets.READ,Stratus.fileop.CREATE,ZohoCatalyst.tables.rows.CREATE,ZohoCatalyst.tables.rows.READ,ZohoCatalyst.tables.rows.UPDATE,ZohoCatalyst.tables.READ,ZohoCatalyst.tables.READ,ZohoCatalyst.tables.columns.READ,ZohoCatalyst.tables.columns.READ,ZohoCatalyst.cache.CREATE,ZohoCatalyst.cache.CREATE"
+SCOPE = "QuickML.deployment.READ,ZohoCatalyst.mlkit.READ,ZohoProfile.userinfo.read,ZohoCatalyst.buckets.READ,Stratus.fileop.CREATE,ZohoCatalyst.tables.rows.CREATE,ZohoCatalyst.tables.rows.READ,ZohoCatalyst.tables.rows.UPDATE,ZohoCatalyst.tables.READ,ZohoCatalyst.tables.READ,ZohoCatalyst.tables.columns.READ,ZohoCatalyst.tables.columns.READ,ZohoCatalyst.cache.CREATE,ZohoCatalyst.cache.CREATE,ZohoCatalyst.tables.rows.DELETE"
 
 
 ORG_ID = os.getenv("ORG_ID")

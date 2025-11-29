@@ -59,6 +59,101 @@ BOT_NAME = "workspace-vita"
 open_issues = {}  # {issue_id: {"opened_at": ts, "title": str, "category": str, "severity": str}}
 
 # ---------- LLM Classification ----------
+# def classify_message_llm(text: str) -> dict:
+#     url = f"https://api.catalyst.zoho.com/quickml/v2/project/{CATALYST_PROJECT_ID}/llm/chat"
+#     headers = {
+#         "Content-Type": "application/json",
+#         "Authorization": f"Bearer {CATALYST_TOKEN}",
+#         "CATALYST-ORG": CATALYST_ORG_ID,
+#     }
+    
+#     # ✅ SHORTER BUT CLEARER PROMPT
+#     prompt = f"""Classify this message:
+
+# "{text}"
+
+# Return ONLY JSON:
+# {{"role": "incident|discussion|resolution", "category": "database|cache|auth|network|security|deployment|other", "severity": "low|medium|high"}}
+
+# Role rules:
+# • incident = reports CURRENT broken/failing system (e.g. "X is down", "getting errors")
+# • resolution = states problem is ALREADY fixed (e.g. "fixed", "working now", "resolved")
+# • discussion = investigating, planning, explaining, or any other message
+
+# Category: database, cache, auth, network, security, deployment, or other
+# Severity: low, medium, or high
+
+# Examples:
+# "API is down" → incident, network, high
+# "let me check logs" → discussion, other, low
+# "fixed the bug" → resolution, other, medium
+
+# JSON:"""
+
+#     data = {
+#         "prompt": prompt,
+#         "model": "crm-di-qwen_text_14b-fp8-it",
+#         "system_prompt": "Classify messages strictly: 'incident'=currently broken, 'resolution'=already fixed, 'discussion'=everything else. Return valid JSON only.",
+#         "top_p": 0.7,
+#         "top_k": 30,
+#         "temperature": 0.1,
+#         "max_tokens": 100,
+#     }
+
+#     try:
+#         resp = requests.post(url, json=data, headers=headers, timeout=30)
+        
+#         if resp.status_code != 200:
+#             print(f"❌ LLM error {resp.status_code}: {resp.text}")
+#             return {"role": "discussion", "category": "other", "severity": "low"}
+        
+#         result = resp.json()
+        
+#         # Extract output
+#         output_text = None
+#         if "data" in result and "output_text" in result["data"]:
+#             output_text = result["data"]["output_text"]
+#         elif "output_text" in result:
+#             output_text = result["output_text"]
+#         elif "response" in result:
+#             output_text = result["response"]
+        
+#         if not output_text:
+#             print("❌ No output from LLM")
+#             return {"role": "discussion", "category": "other", "severity": "low"}
+        
+#         # Extract JSON
+#         output_text = output_text.strip()
+#         if "{" in output_text and "}" in output_text:
+#             start = output_text.index("{")
+#             end = output_text.rindex("}") + 1
+#             json_str = output_text[start:end]
+#         else:
+#             json_str = output_text
+        
+#         classification = json.loads(json_str)
+        
+#         # Validate
+#         if "role" not in classification or "category" not in classification or "severity" not in classification:
+#             print(f"❌ Invalid classification: {classification}")
+#             return {"role": "discussion", "category": "other", "severity": "low"}
+        
+#         # Validate role value
+#         if classification["role"] not in ["incident", "discussion", "resolution"]:
+#             print(f"❌ Invalid role: {classification['role']}")
+#             return {"role": "discussion", "category": "other", "severity": "low"}
+        
+#         print(f"✅ Parsed classification: {classification}")
+#         return classification
+        
+#     except json.JSONDecodeError as e:
+#         print(f"❌ JSON parse error: {e}")
+#         return {"role": "discussion", "category": "other", "severity": "low"}
+#     except Exception as e:
+#         print(f"❌ Classification error: {e}")
+#         import traceback
+#         traceback.print_exc()
+#         return {"role": "discussion", "category": "other", "severity": "low"}
 
 def classify_message_llm(text: str) -> dict:
     url = f"https://api.catalyst.zoho.com/quickml/v2/project/{CATALYST_PROJECT_ID}/llm/chat"
@@ -77,9 +172,9 @@ Return ONLY this JSON (no extra text):
 
 Rules:
 - role:
-  - "resolution" ONLY if the message explicitly states that a problem is ALREADY fixed, resolved, closed, working now, back to normal, or issue is gone. Examples: "fixed it", "issue resolved", "back to normal now", "working fine now"
-  - "incident" if it reports an active problem, failure, error, outage, or something broken
-  - "discussion" for everything else including: suggestions ("let's try"), questions ("should we?"), plans ("we need to"), explanations, acknowledgments, or any chat that is NOT an active incident report or a completion statement
+  - "resolution" ONLY if the message explicitly states that a problem is ALREADY fixed, resolved, closed, working now, back to normal, or issue is gone. Examples: "fixed it", "issue resolved", "back to normal now", "working fine now" . sometimes people can discuss like i think i got the issue, this is due to so and so reasons, lemme do smthg else.. so these are purely discussions.. not resolutions. Resoulution comes in if they are purely confident about it, like this issue is fixed, back to normal.. similar. Think from perspective of IT Employees
+  - "incident" if it reports an active problem, failure, error, outage, or something broken. Think from perspective of IT Employees
+  - "discussion" for everything else including: suggestions ("let's try"), questions ("should we?"), plans ("we need to"), explanations, acknowledgments, or any chat that is NOT an active incident report or a completion statement. Think from perspective of IT Employees . There can be technical and casual convos as well. 
 - category: database, cache, auth, network, security, deployment, or other
 - severity: low, medium, or high
 
@@ -88,7 +183,7 @@ JSON:"""
     data = {
         "prompt": prompt,
         "model": "crm-di-qwen_text_14b-fp8-it",
-        "system_prompt": "You classify engineering messages. Return ONLY valid JSON. Be strict: 'resolution' means the problem is ALREADY solved, not planned or being worked on.",
+        "system_prompt": "You classify engineering messages.Your decisions lead to important IT Decisions. So Be very careful.  Return ONLY valid JSON. Be strict: 'resolution' means the problem is ALREADY solved, not planned or being worked on.",
         "top_p": 0.8,
         "top_k": 40,
         "best_of": 1,
@@ -942,7 +1037,6 @@ Provide a concise 2-3 sentence summary of the resolution."""
 
 
 # ---------- Main Indexing Pipeline ----------
-
 def index_message(conversation_id, message_id, sender_id, timestamp_ms, message_text):
     """
     1. Classify with LLM
@@ -966,7 +1060,7 @@ def index_message(conversation_id, message_id, sender_id, timestamp_ms, message_
     
     # 3. Link to issue
     if role == "incident":
-        # 3A-1. Reuse existing open issue with identical title (avoid duplicates)
+        # Check for duplicate title
         existing_open = fetch_open_issues()
         normalized_title = message_text.strip().lower()
         for row in existing_open:
@@ -974,12 +1068,10 @@ def index_message(conversation_id, message_id, sender_id, timestamp_ms, message_
                 issue_id = row.get("issue_id")
                 print(f"🔗 Reusing existing open issue for same title: {issue_id}")
                 break
-
-        # 3A-2. If not found by title, try similarity to other open incidents
+        
+        # If not found, try similarity
         if not issue_id:
-            q_filter = Filter(
-                must=[FieldCondition(key="role", match=MatchValue(value="incident"))]
-            )
+            q_filter = Filter(must=[FieldCondition(key="role", match=MatchValue(value="incident"))])
             hits = qdrant.search(
                 collection_name=QDRANT_COLLECTION,
                 query_vector=emb,
@@ -1001,140 +1093,251 @@ def index_message(conversation_id, message_id, sender_id, timestamp_ms, message_
             if best_issue_id:
                 issue_id = best_issue_id
                 print(f"🔗 Linked incident to similar open issue: {issue_id} (score={best_score:.2f})")
-
-        # 3A-3. If still no issue_id, create a new issue
+        
+        # Create new issue if still no match
         if not issue_id:
             issue_id = str(uuid.uuid4())
             title = message_text[:100] + ("..." if len(message_text) > 100 else "")
             create_issue_in_datastore(issue_id, title, "Cliq", category, severity, timestamp_ms)
             print(f"🆕 Created new issue: {issue_id}")
-    # if role == "incident":
-    #     # Check if similar open incident exists
-    #     similar_issue_id, score = find_similar_open_incident(emb, threshold=0.75)
-        
-    #     if similar_issue_id:
-    #         print(f"🔗 Linked to existing issue: {similar_issue_id} (score={score:.2f})")
-    #         issue_id = similar_issue_id
-    #     else:
-    #         # Create new issue
-    #         issue_id = str(uuid.uuid4())
-    #         title = message_text[:100] + ("..." if len(message_text) > 100 else "")
-    #         open_issues[issue_id] = {
-    #             "opened_at": timestamp_ms,
-    #             "title": title,
-    #             "category": category,
-    #             "severity": severity,
-    #         }
-    #         create_issue_in_datastore(issue_id, title, "Cliq", category, severity, timestamp_ms)
-    #         print(f"🆕 Created new issue: {issue_id}")
     
-    # elif role in ["discussion", "resolution"]:
-    #     # Link to nearest open issue
-    #     similar_issue_id, score = find_similar_open_incident(emb, threshold=0.65)
-    #     if similar_issue_id:
-    #         issue_id = similar_issue_id
-    #         print(f"🔗 Linked {role} to issue: {issue_id} (score={score:.2f})")
-            
-    #         # If resolution, check if we should close the issue
-    #         if role == "resolution":
-    #             # Simple heuristic: if message says "fixed", "resolved", "closed", close it
-    #             if any(w in message_text.lower() for w in ["fixed", "resolved", "closed", "done"]):
-    #                 close_issue_in_datastore(issue_id, timestamp_ms)
-    #                 if issue_id in open_issues:
-    #                     del open_issues[issue_id]
-    #                 print(f"✅ Closed issue: {issue_id}")
-    
-    # elif role in ["discussion", "resolution"]:
-    # # Link to nearest open issue using Qdrant, but don't depend on in-memory open_issues
-    #     q_filter = Filter(
-    #         must=[FieldCondition(key="role", match=MatchValue(value="incident"))]
-    #     )
-    #     hits = qdrant.search(
-    #         collection_name=QDRANT_COLLECTION,
-    #         query_vector=emb,
-    #         query_filter=q_filter,
-    #         limit=3,
-    #     )
-    #     linked_issue_id = None
-    #     best_score = 0.0
-
-    #     for h in hits:
-    #         if not h.payload:
-    #             continue
-    #         candidate_issue_id = h.payload.get("issue_id")
-    #         if not candidate_issue_id:
-    #             continue
-    #         # Check if this issue is still open in Data Store
-    #         open_issues_rows = fetch_open_issues()
-    #         if any(row.get("issue_id") == candidate_issue_id for row in open_issues_rows):
-    #             linked_issue_id = candidate_issue_id
-    #             best_score = h.score
-    #             break
-
-    #     if linked_issue_id:
-    #         issue_id = linked_issue_id
-    #         print(f"🔗 Linked {role} to issue: {issue_id} (score={best_score:.2f})")
-
-    #         # If resolution, close the issue
-    #         if role == "resolution" and any(w in message_text.lower() for w in ["fixed", "resolved", "closed", "done"]):
-    #             ok = close_issue_in_datastore(issue_id, timestamp_ms)
-    #             # Also remove from in-memory cache if present
-    #             if ok:
-    #                 if issue_id in open_issues:
-    #                     del open_issues[issue_id]
-    #                 print(f"✅ Closed issue: {issue_id}")
-    #             else:
-    #                 print("failed to close the issue in DS ... DOT")
-    #     else:
-    #         print(f"No open issue found to link this {role} message.")
-
     elif role in ["discussion", "resolution"]:
-        issue_id = None
-
-        # Link to latest open issue (simple and robust)
+        # Link to latest open issue
         latest_open = get_latest_open_issue_for_conversation(conversation_id)
         if latest_open:
             issue_id = latest_open.get("issue_id")
             print(f"🔗 Linked {role} to latest open issue: {issue_id}")
         else:
             print(f"No open issue in DS for conversation {conversation_id}; {role} unlinked.")
-
-        # If this is a resolution and text clearly says it is fixed/closed, close the issue
-        if role == "resolution" and issue_id and any(
-            w in message_text.lower() for w in ["fixed", "resolved", "closed", "back to normal", "no issues"]
-        ):
-            ok = close_issue_in_datastore(issue_id, timestamp_ms)
-            if ok:
-                print(f"✅ Closed issue (DS): {issue_id}")
-            else:
-                print(f"❌ Failed to close issue in DS: {issue_id}")
-
-
-
-        # 4. Store in Data Store
-        row_id = insert_message_into_datastore(
-            conversation_id, message_id, sender_id, timestamp_ms,
-            message_text, role, category, severity, issue_id
-        )
         
-        # 5. Store in Qdrant
-        qdrant_id = normalize_message_id(message_id)
-        point = PointStruct(
-            id=qdrant_id,
-            vector=emb,
-            payload={
-                "conversation_id": conversation_id,
-                "sender_id": sender_id,
-                "role": role,
-                "category": category,
-                "severity": severity,
-                "issue_id": issue_id or "",
-                "row_id": row_id,
-                "message_id": message_id,
-            },
-        )
-        qdrant.upsert(QDRANT_COLLECTION, [point])
-        print(f"✅ Indexed in Qdrant: {message_id}")
+        # If resolution, close issue
+        if role == "resolution" and issue_id:
+            messages = fetch_messages_by_issue_id(issue_id)
+            summary = summarize_resolution_with_llm(messages)
+            ok = store_resolution_summary(issue_id, summary, timestamp_ms)
+            if ok:
+                print(f"✅ Closed issue with summary: {issue_id}")
+            else:
+                print(f"❌ Failed to store resolution summary: {issue_id}")
+    
+    # ✅ 4. Store in Data Store (ALWAYS, for ALL roles)
+    row_id = insert_message_into_datastore(
+        conversation_id, message_id, sender_id, timestamp_ms,
+        message_text, role, category, severity, issue_id
+    )
+    
+    # ✅ 5. Store in Qdrant (ALWAYS, for ALL roles)
+    qdrant_id = normalize_message_id(message_id)
+    point = PointStruct(
+        id=qdrant_id,
+        vector=emb,
+        payload={
+            "conversation_id": conversation_id,
+            "sender_id": sender_id,
+            "role": role,
+            "category": category,
+            "severity": severity,
+            "issue_id": issue_id or "",
+            "row_id": row_id,
+            "message_id": message_id,
+        },
+    )
+    qdrant.upsert(QDRANT_COLLECTION, [point])
+    print(f"✅ Indexed in Qdrant: {message_id} (role={role})")
+
+
+# def index_message(conversation_id, message_id, sender_id, timestamp_ms, message_text):
+#     """
+#     1. Classify with LLM
+#     2. Embed message
+#     3. Link to issue (or create new issue)
+#     4. Store in DS + Qdrant
+#     """
+#     # 1. LLM Classification
+#     cls = classify_message_llm(message_text)
+#     role = cls.get("role", "discussion")
+#     category = cls.get("category", "other")
+#     severity = cls.get("severity", "low")
+    
+#     print(f"📋 Role: {role}, Category: {category}, Severity: {severity}")
+    
+#     # 2. Embed
+#     emb = embed_text(message_text)
+#     ensure_qdrant_collection(len(emb))
+    
+#     issue_id = None
+    
+#     # 3. Link to issue
+#     if role == "incident":
+#         # 3A-1. Reuse existing open issue with identical title (avoid duplicates)
+#         existing_open = fetch_open_issues()
+#         normalized_title = message_text.strip().lower()
+#         for row in existing_open:
+#             if row.get("title", "").strip().lower() == normalized_title:
+#                 issue_id = row.get("issue_id")
+#                 print(f"🔗 Reusing existing open issue for same title: {issue_id}")
+#                 break
+
+#         # 3A-2. If not found by title, try similarity to other open incidents
+#         if not issue_id:
+#             q_filter = Filter(
+#                 must=[FieldCondition(key="role", match=MatchValue(value="incident"))]
+#             )
+#             hits = qdrant.search(
+#                 collection_name=QDRANT_COLLECTION,
+#                 query_vector=emb,
+#                 query_filter=q_filter,
+#                 limit=5,
+#             )
+#             open_ids = {r.get("issue_id") for r in existing_open if r.get("issue_id")}
+#             best_issue_id = None
+#             best_score = 0.0
+#             for h in hits:
+#                 if not h.payload:
+#                     continue
+#                 cand_id = h.payload.get("issue_id")
+#                 if not cand_id or cand_id not in open_ids:
+#                     continue
+#                 if h.score > best_score and h.score >= 0.75:
+#                     best_issue_id = cand_id
+#                     best_score = h.score
+#             if best_issue_id:
+#                 issue_id = best_issue_id
+#                 print(f"🔗 Linked incident to similar open issue: {issue_id} (score={best_score:.2f})")
+
+#         # 3A-3. If still no issue_id, create a new issue
+#         if not issue_id:
+#             issue_id = str(uuid.uuid4())
+#             title = message_text[:100] + ("..." if len(message_text) > 100 else "")
+#             create_issue_in_datastore(issue_id, title, "Cliq", category, severity, timestamp_ms)
+#             print(f"🆕 Created new issue: {issue_id}")
+#     # if role == "incident":
+#     #     # Check if similar open incident exists
+#     #     similar_issue_id, score = find_similar_open_incident(emb, threshold=0.75)
+        
+#     #     if similar_issue_id:
+#     #         print(f"🔗 Linked to existing issue: {similar_issue_id} (score={score:.2f})")
+#     #         issue_id = similar_issue_id
+#     #     else:
+#     #         # Create new issue
+#     #         issue_id = str(uuid.uuid4())
+#     #         title = message_text[:100] + ("..." if len(message_text) > 100 else "")
+#     #         open_issues[issue_id] = {
+#     #             "opened_at": timestamp_ms,
+#     #             "title": title,
+#     #             "category": category,
+#     #             "severity": severity,
+#     #         }
+#     #         create_issue_in_datastore(issue_id, title, "Cliq", category, severity, timestamp_ms)
+#     #         print(f"🆕 Created new issue: {issue_id}")
+    
+#     # elif role in ["discussion", "resolution"]:
+#     #     # Link to nearest open issue
+#     #     similar_issue_id, score = find_similar_open_incident(emb, threshold=0.65)
+#     #     if similar_issue_id:
+#     #         issue_id = similar_issue_id
+#     #         print(f"🔗 Linked {role} to issue: {issue_id} (score={score:.2f})")
+            
+#     #         # If resolution, check if we should close the issue
+#     #         if role == "resolution":
+#     #             # Simple heuristic: if message says "fixed", "resolved", "closed", close it
+#     #             if any(w in message_text.lower() for w in ["fixed", "resolved", "closed", "done"]):
+#     #                 close_issue_in_datastore(issue_id, timestamp_ms)
+#     #                 if issue_id in open_issues:
+#     #                     del open_issues[issue_id]
+#     #                 print(f"✅ Closed issue: {issue_id}")
+    
+#     # elif role in ["discussion", "resolution"]:
+#     # # Link to nearest open issue using Qdrant, but don't depend on in-memory open_issues
+#     #     q_filter = Filter(
+#     #         must=[FieldCondition(key="role", match=MatchValue(value="incident"))]
+#     #     )
+#     #     hits = qdrant.search(
+#     #         collection_name=QDRANT_COLLECTION,
+#     #         query_vector=emb,
+#     #         query_filter=q_filter,
+#     #         limit=3,
+#     #     )
+#     #     linked_issue_id = None
+#     #     best_score = 0.0
+
+#     #     for h in hits:
+#     #         if not h.payload:
+#     #             continue
+#     #         candidate_issue_id = h.payload.get("issue_id")
+#     #         if not candidate_issue_id:
+#     #             continue
+#     #         # Check if this issue is still open in Data Store
+#     #         open_issues_rows = fetch_open_issues()
+#     #         if any(row.get("issue_id") == candidate_issue_id for row in open_issues_rows):
+#     #             linked_issue_id = candidate_issue_id
+#     #             best_score = h.score
+#     #             break
+
+#     #     if linked_issue_id:
+#     #         issue_id = linked_issue_id
+#     #         print(f"🔗 Linked {role} to issue: {issue_id} (score={best_score:.2f})")
+
+#     #         # If resolution, close the issue
+#     #         if role == "resolution" and any(w in message_text.lower() for w in ["fixed", "resolved", "closed", "done"]):
+#     #             ok = close_issue_in_datastore(issue_id, timestamp_ms)
+#     #             # Also remove from in-memory cache if present
+#     #             if ok:
+#     #                 if issue_id in open_issues:
+#     #                     del open_issues[issue_id]
+#     #                 print(f"✅ Closed issue: {issue_id}")
+#     #             else:
+#     #                 print("failed to close the issue in DS ... DOT")
+#     #     else:
+#     #         print(f"No open issue found to link this {role} message.")
+
+#     elif role in ["discussion", "resolution"]:
+#         issue_id = None
+
+#         # Link to latest open issue (simple and robust)
+#         latest_open = get_latest_open_issue_for_conversation(conversation_id)
+#         if latest_open:
+#             issue_id = latest_open.get("issue_id")
+#             print(f"🔗 Linked {role} to latest open issue: {issue_id}")
+#         else:
+#             print(f"No open issue in DS for conversation {conversation_id}; {role} unlinked.")
+
+#         # If this is a resolution and text clearly says it is fixed/closed, close the issue
+#         if role == "resolution" and issue_id and any(
+#             w in message_text.lower() for w in ["fixed", "resolved", "closed", "back to normal", "no issues"]
+#         ):
+#             ok = close_issue_in_datastore(issue_id, timestamp_ms)
+#             if ok:
+#                 print(f"✅ Closed issue (DS): {issue_id}")
+#             else:
+#                 print(f"❌ Failed to close issue in DS: {issue_id}")
+
+
+
+#         # 4. Store in Data Store
+#         row_id = insert_message_into_datastore(
+#             conversation_id, message_id, sender_id, timestamp_ms,
+#             message_text, role, category, severity, issue_id
+#         )
+        
+#         # 5. Store in Qdrant
+#         qdrant_id = normalize_message_id(message_id)
+#         point = PointStruct(
+#             id=qdrant_id,
+#             vector=emb,
+#             payload={
+#                 "conversation_id": conversation_id,
+#                 "sender_id": sender_id,
+#                 "role": role,
+#                 "category": category,
+#                 "severity": severity,
+#                 "issue_id": issue_id or "",
+#                 "row_id": row_id,
+#                 "message_id": message_id,
+#             },
+#         )
+#         qdrant.upsert(QDRANT_COLLECTION, [point])
+#         print(f"✅ Indexed in Qdrant: {message_id}")
 
 
 # ---------- Command Handlers ----------
@@ -1693,12 +1896,44 @@ def search_incidents_card_json():
     if not query:
         return jsonify({"results": [], "count": 0})
     
-    print(f"🔍 Card search: {query}")
+    print(f"\n{'='*60}")
+    print(f"🔍 SEARCH QUERY: '{query}'")
+    print(f"{'='*60}")
     
     # Embed & search incidents
     q_emb = embed_text(query)
+    print(f"✅ Embedded query (vector size: {len(q_emb)})")
+    
     q_filter = Filter(must=[FieldCondition(key="role", match=MatchValue(value="incident"))])
-    hits = qdrant.search(collection_name=QDRANT_COLLECTION, query_vector=q_emb, query_filter=q_filter, limit=10)
+    
+    # ✅ LOWER THRESHOLD AND INCREASE LIMIT
+    hits = qdrant.search(
+        collection_name=QDRANT_COLLECTION, 
+        query_vector=q_emb, 
+        query_filter=q_filter, 
+        limit=20,  # More results
+        score_threshold=0.3  # ✅ Lower threshold (30% match)
+    )
+    
+    print(f"📊 Qdrant returned {len(hits)} hits")
+    
+    if hits:
+        print(f"\n🎯 TOP MATCHES:")
+        for i, hit in enumerate(hits[:5], 1):
+            issue_id = hit.payload.get("issue_id", "N/A")[:12]
+            score = hit.score
+            print(f"  #{i}: score={score:.3f} | issue_id={issue_id}")
+    else:
+        print("❌ NO HITS FOUND!")
+        # Debug: Try searching WITHOUT filter to see if ANY results exist
+        all_hits = qdrant.search(
+            collection_name=QDRANT_COLLECTION,
+            query_vector=q_emb,
+            limit=5
+        )
+        print(f"🔍 Search without filter found {len(all_hits)} results:")
+        for hit in all_hits:
+            print(f"  - role={hit.payload.get('role')}, score={hit.score:.3f}")
     
     if not hits:
         return jsonify({"results": [], "count": 0})
@@ -1710,13 +1945,18 @@ def search_incidents_card_json():
             issue_scores.setdefault(iid, 0)
             issue_scores[iid] = max(issue_scores[iid], hit.score)
     
-    # Fetch ALL issues & match scored ones (latest first within scores)
+    print(f"\n📋 Unique issues found: {len(issue_scores)}")
+    
+    # Fetch ALL issues & match scored ones
     all_issues = fetch_all_issues()
+    print(f"✅ Fetched {len(all_issues)} total issues from DataStore")
+    
     results = []
     
     for issue_id, score in sorted(issue_scores.items(), key=lambda x: x[1], reverse=True)[:5]:
         issue = next((i for i in all_issues if i.get("issue_id") == issue_id), None)
         if not issue:
+            print(f"⚠️ Issue {issue_id[:12]} found in Qdrant but NOT in DataStore!")
             continue
         
         # Dates
@@ -1740,8 +1980,70 @@ def search_incidents_card_json():
             "resolution_summary": resolution_summary[:150],
             "score": round(score, 2)
         })
+        
+        print(f"✅ Added result: {issue.get('title', '')[:50]} (score={score:.2f})")
+    
+    print(f"\n✅ RETURNING {len(results)} results")
+    print(f"{'='*60}\n")
     
     return jsonify({"results": results, "count": len(results)})
+
+
+# @app.route('/search_incidents_card_json', methods=['GET'])
+# def search_incidents_card_json():
+#     query = request.args.get("query", "").strip()
+#     if not query:
+#         return jsonify({"results": [], "count": 0})
+    
+#     print(f"🔍 Card search: {query}")
+    
+#     # Embed & search incidents
+#     q_emb = embed_text(query)
+#     q_filter = Filter(must=[FieldCondition(key="role", match=MatchValue(value="incident"))])
+#     hits = qdrant.search(collection_name=QDRANT_COLLECTION, query_vector=q_emb, query_filter=q_filter, limit=10)
+    
+#     if not hits:
+#         return jsonify({"results": [], "count": 0})
+    
+#     # Get scored issue_ids (closest matches first)
+#     issue_scores = {}
+#     for hit in hits:
+#         if hit.payload and (iid := hit.payload.get("issue_id")):
+#             issue_scores.setdefault(iid, 0)
+#             issue_scores[iid] = max(issue_scores[iid], hit.score)
+    
+#     # Fetch ALL issues & match scored ones (latest first within scores)
+#     all_issues = fetch_all_issues()
+#     results = []
+    
+#     for issue_id, score in sorted(issue_scores.items(), key=lambda x: x[1], reverse=True)[:5]:
+#         issue = next((i for i in all_issues if i.get("issue_id") == issue_id), None)
+#         if not issue:
+#             continue
+        
+#         # Dates
+#         opened_ts = int(issue.get("opened_at", 0))
+#         opened_str = datetime.fromtimestamp(opened_ts/1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M") if opened_ts else "N/A"
+#         resolved_ts = int(issue.get("resolved_at", 0))
+#         resolved_str = datetime.fromtimestamp(resolved_ts/1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M") if resolved_ts else "Open"
+        
+#         # Resolution summary
+#         resolution_summary = issue.get("resolution_summary", "No resolution recorded")
+#         if issue.get("status", "").lower() == "open":
+#             resolution_summary = "🟡 Open - No resolution yet"
+        
+#         results.append({
+#             "title": issue.get("title", "Untitled")[:80],
+#             "status": issue.get("status", "Open"),
+#             "category": issue.get("category", "other"),
+#             "severity": issue.get("severity", "low"),
+#             "opened_at": opened_str,
+#             "resolved_at": resolved_str,
+#             "resolution_summary": resolution_summary[:150],
+#             "score": round(score, 2)
+#         })
+    
+#     return jsonify({"results": results, "count": len(results)})
 
 def store_resolution_summary(issue_id: str, summary: str, resolved_at_ms: int) -> bool:
     if not (CATALYST_TOKEN and CATALYST_PROJECT_ID):
@@ -1784,12 +2086,12 @@ def debug_qdrant():
         # Get all points
         result = qdrant.scroll(
             collection_name=QDRANT_COLLECTION,
-            limit=10,
+            limit=50,  # ✅ Increased to get more
             with_payload=True,
             with_vectors=False
         )
         
-        points = result[0]  # List of points
+        points = result[0]
         
         debug_info = {
             "total_points": len(points),
@@ -1798,6 +2100,7 @@ def debug_qdrant():
             "resolutions": []
         }
         
+        # Also fetch messages from DataStore to get text
         for point in points:
             role = point.payload.get("role", "unknown")
             issue_id = point.payload.get("issue_id", "none")
@@ -1806,7 +2109,7 @@ def debug_qdrant():
             item = {
                 "role": role,
                 "issue_id": issue_id[:12] + "..." if issue_id else "none",
-                "message_id": message_id
+                "message_id": message_id,
             }
             
             if role == "incident":
@@ -1816,7 +2119,388 @@ def debug_qdrant():
             elif role == "resolution":
                 debug_info["resolutions"].append(item)
         
+        # ✅ NOW fetch the actual incident messages from DataStore
+        if debug_info["incidents"]:
+            url = f"https://api.catalyst.zoho.com/baas/v1/project/{CATALYST_PROJECT_ID}/table/{CONVERSATIONS_TABLE}/row"
+            headers = {
+                "Authorization": f"Zoho-oauthtoken {CATALYST_TOKEN}",
+                "CATALYST-ORG": CATALYST_ORG_ID,
+            }
+            
+            try:
+                resp = requests.get(f"{url}?max_rows=100", headers=headers, timeout=10)
+                if resp.status_code == 200:
+                    all_messages = resp.json().get("data", [])
+                    
+                    # Match incidents with their text
+                    for item in debug_info["incidents"]:
+                        msg_id = item["message_id"]
+                        msg = next((m for m in all_messages if m.get("message_id") == msg_id), None)
+                        if msg:
+                            item["text"] = msg.get("message_text", "N/A")[:100]  # First 100 chars
+                            item["category"] = msg.get("category", "N/A")
+            except Exception as e:
+                debug_info["error"] = f"Failed to fetch messages: {e}"
+        
         return jsonify(debug_info)
+        
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+@app.route('/clear_qdrant', methods=['POST'])
+def clear_qdrant():
+    """Delete all points and recreate collection with CORRECT dimensions"""
+    try:
+        # Delete collection
+        try:
+            qdrant.delete_collection(collection_name=QDRANT_COLLECTION)
+            print(f"✅ Deleted collection {QDRANT_COLLECTION}")
+        except Exception as e:
+            print(f"Collection didn't exist or already deleted: {e}")
+        
+        # ✅ Get correct dimension from a test embedding
+        test_emb = embed_text("test")
+        vector_dim = len(test_emb)
+        print(f"✅ Detected vector dimension: {vector_dim}")
+        
+        # Recreate with CORRECT dimension
+        qdrant.create_collection(
+            collection_name=QDRANT_COLLECTION,
+            vectors_config=VectorParams(size=vector_dim, distance=Distance.COSINE),  # ✅ Use actual dimension
+        )
+        
+        # Recreate indexes
+        for field in ["role", "category", "issue_id"]:
+            try:
+                qdrant.create_payload_index(
+                    collection_name=QDRANT_COLLECTION,
+                    field_name=field,
+                    field_schema=PayloadSchemaType.KEYWORD,
+                )
+            except:
+                pass
+        
+        print(f"✅ Recreated collection {QDRANT_COLLECTION} with dimension {vector_dim}")
+        return jsonify({
+            "status": "success", 
+            "message": f"Qdrant cleared and recreated with dimension {vector_dim}"
+        })
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"status": "error", "message": str(e)})
+
+
+@app.route('/reindex_all', methods=['POST'])
+def reindex_all():
+    """Re-index all messages from DataStore into Qdrant"""
+    
+    if not (CATALYST_TOKEN and CATALYST_PROJECT_ID):
+        return jsonify({"error": "Missing Catalyst config"})
+    
+    url = f"https://api.catalyst.zoho.com/baas/v1/project/{CATALYST_PROJECT_ID}/table/{CONVERSATIONS_TABLE}/row"
+    headers = {
+        "Authorization": f"Zoho-oauthtoken {CATALYST_TOKEN}",
+        "CATALYST-ORG": CATALYST_ORG_ID,
+    }
+    
+    all_messages = []
+    next_token = None
+    
+    try:
+        # Fetch ALL messages from DataStore
+        while True:
+            params = "max_rows=300"
+            if next_token:
+                params += f"&next_token={next_token}"
+            
+            resp = requests.get(f"{url}?{params}", headers=headers, timeout=10)
+            if resp.status_code != 200:
+                break
+            
+            body = resp.json()
+            rows = body.get("data", [])
+            all_messages.extend(rows)
+            
+            next_token = body.get("next_token")
+            if not next_token:
+                break
+        
+        print(f"📥 Fetched {len(all_messages)} messages from DataStore")
+        
+        # Index each message into Qdrant
+        indexed_count = 0
+        
+        for msg in all_messages:
+            message_text = msg.get("message_text", "")
+            message_id = msg.get("message_id", "")
+            
+            if not message_text or not message_id:
+                continue
+            
+            # Embed
+            emb = embed_text(message_text)
+            
+            # Create point
+            qdrant_id = normalize_message_id(message_id)
+            point = PointStruct(
+                id=qdrant_id,
+                vector=emb,
+                payload={
+                    "conversation_id": msg.get("conversation_id", ""),
+                    "sender_id": msg.get("sender_id", ""),
+                    "role": msg.get("role", "discussion"),
+                    "category": msg.get("category", "other"),
+                    "severity": msg.get("severity", "low"),
+                    "issue_id": msg.get("issue_id", ""),
+                    "message_id": message_id,
+                },
+            )
+            
+            qdrant.upsert(QDRANT_COLLECTION, [point])
+            indexed_count += 1
+            
+            if indexed_count % 10 == 0:
+                print(f"  Indexed {indexed_count}/{len(all_messages)}...")
+        
+        print(f"✅ Successfully indexed {indexed_count} messages")
+        return jsonify({
+            "status": "success",
+            "total_messages": len(all_messages),
+            "indexed": indexed_count
+        })
+        
+    except Exception as e:
+        print(f"❌ Reindex error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"status": "error", "message": str(e)})
+
+
+@app.route('/clear_conversations', methods=['POST'])
+def clear_conversations():
+    """Delete all rows from conversations table"""
+    if not (CATALYST_TOKEN and CATALYST_PROJECT_ID):
+        return jsonify({"error": "Missing Catalyst config"})
+    
+    url = f"https://api.catalyst.zoho.com/baas/v1/project/{CATALYST_PROJECT_ID}/table/{CONVERSATIONS_TABLE}/row"
+    headers = {
+        "Authorization": f"Zoho-oauthtoken {CATALYST_TOKEN}",
+        "CATALYST-ORG": CATALYST_ORG_ID,
+    }
+    
+    try:
+        # 1. Fetch all ROWIDs
+        all_rows = []
+        next_token = None
+        
+        while True:
+            params = "max_rows=300"
+            if next_token:
+                params += f"&next_token={next_token}"
+            
+            resp = requests.get(f"{url}?{params}", headers=headers, timeout=10)
+            if resp.status_code != 200:
+                break
+            
+            body = resp.json()
+            rows = body.get("data", [])
+            all_rows.extend(rows)
+            
+            next_token = body.get("next_token")
+            if not next_token:
+                break
+        
+        print(f"📥 Found {len(all_rows)} conversation rows to delete")
+        
+        # 2. Delete in batches (max 100 per request)
+        deleted_count = 0
+        batch_size = 100
+        
+        for i in range(0, len(all_rows), batch_size):
+            batch = all_rows[i:i+batch_size]
+            row_ids = [str(row.get("ROWID")) for row in batch if row.get("ROWID")]
+            
+            if not row_ids:
+                continue
+            
+            # Delete using query params (Catalyst format)
+            delete_url = f"{url}?ids={','.join(row_ids)}"
+            del_resp = requests.delete(delete_url, headers=headers, timeout=10)
+            
+            if del_resp.status_code == 200:
+                deleted_count += len(row_ids)
+                print(f"  Deleted {deleted_count}/{len(all_rows)}...")
+            else:
+                print(f"❌ Delete failed: {del_resp.status_code} {del_resp.text}")
+        
+        print(f"✅ Deleted {deleted_count} conversation rows")
+        return jsonify({
+            "status": "success",
+            "table": "conversations",
+            "deleted": deleted_count
+        })
+        
+    except Exception as e:
+        print(f"❌ Clear conversations error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"status": "error", "message": str(e)})
+
+
+@app.route('/clear_issues', methods=['POST'])
+def clear_issues():
+    """Delete all rows from issues table"""
+    if not (CATALYST_TOKEN and CATALYST_PROJECT_ID):
+        return jsonify({"error": "Missing Catalyst config"})
+    
+    url = f"https://api.catalyst.zoho.com/baas/v1/project/{CATALYST_PROJECT_ID}/table/{ISSUES_TABLE}/row"
+    headers = {
+        "Authorization": f"Zoho-oauthtoken {CATALYST_TOKEN}",
+        "CATALYST-ORG": CATALYST_ORG_ID,
+    }
+    
+    try:
+        # 1. Fetch all ROWIDs
+        all_rows = []
+        next_token = None
+        
+        while True:
+            params = "max_rows=300"
+            if next_token:
+                params += f"&next_token={next_token}"
+            
+            resp = requests.get(f"{url}?{params}", headers=headers, timeout=10)
+            if resp.status_code != 200:
+                break
+            
+            body = resp.json()
+            rows = body.get("data", [])
+            all_rows.extend(rows)
+            
+            next_token = body.get("next_token")
+            if not next_token:
+                break
+        
+        print(f"📥 Found {len(all_rows)} issue rows to delete")
+        
+        # 2. Delete in batches
+        deleted_count = 0
+        batch_size = 100
+        
+        for i in range(0, len(all_rows), batch_size):
+            batch = all_rows[i:i+batch_size]
+            row_ids = [str(row.get("ROWID")) for row in batch if row.get("ROWID")]
+            
+            if not row_ids:
+                continue
+            
+            delete_url = f"{url}?ids={','.join(row_ids)}"
+            del_resp = requests.delete(delete_url, headers=headers, timeout=10)
+            
+            if del_resp.status_code == 200:
+                deleted_count += len(row_ids)
+                print(f"  Deleted {deleted_count}/{len(all_rows)}...")
+            else:
+                print(f"❌ Delete failed: {del_resp.status_code} {del_resp.text}")
+        
+        print(f"✅ Deleted {deleted_count} issue rows")
+        return jsonify({
+            "status": "success",
+            "table": "issues",
+            "deleted": deleted_count
+        })
+        
+    except Exception as e:
+        print(f"❌ Clear issues error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"status": "error", "message": str(e)})
+
+
+@app.route('/clear_all_data', methods=['POST'])
+def clear_all_data():
+    """Clear Qdrant + Conversations + Issues (FULL RESET)"""
+    results = {}
+    
+    # 1. Clear Qdrant
+    try:
+        qdrant.delete_collection(collection_name=QDRANT_COLLECTION)
+        
+        # Get dimension
+        test_emb = embed_text("test")
+        vector_dim = len(test_emb)
+        
+        # Recreate
+        qdrant.create_collection(
+            collection_name=QDRANT_COLLECTION,
+            vectors_config=VectorParams(size=vector_dim, distance=Distance.COSINE),
+        )
+        
+        for field in ["role", "category", "issue_id"]:
+            try:
+                qdrant.create_payload_index(
+                    collection_name=QDRANT_COLLECTION,
+                    field_name=field,
+                    field_schema=PayloadSchemaType.KEYWORD,
+                )
+            except:
+                pass
+        
+        results["qdrant"] = "cleared"
+        print("✅ Cleared Qdrant")
+    except Exception as e:
+        results["qdrant"] = f"error: {e}"
+    
+    # 2. Clear Conversations
+    conv_result = clear_conversations()
+    results["conversations"] = conv_result.json
+    
+    # 3. Clear Issues
+    issues_result = clear_issues()
+    results["issues"] = issues_result.json
+    
+    return jsonify(results)
+
+
+@app.route('/debug_last_messages', methods=['GET'])
+def debug_last_messages():
+    """Show last 10 messages from DataStore with their classifications"""
+    if not (CATALYST_TOKEN and CATALYST_PROJECT_ID):
+        return jsonify({"error": "Missing config"})
+    
+    url = f"https://api.catalyst.zoho.com/baas/v1/project/{CATALYST_PROJECT_ID}/table/{CONVERSATIONS_TABLE}/row"
+    headers = {
+        "Authorization": f"Zoho-oauthtoken {CATALYST_TOKEN}",
+        "CATALYST-ORG": CATALYST_ORG_ID,
+    }
+    
+    try:
+        resp = requests.get(f"{url}?max_rows=20", headers=headers, timeout=10)
+        if resp.status_code != 200:
+            return jsonify({"error": "Failed to fetch"})
+        
+        rows = resp.json().get("data", [])
+        
+        # Sort by timestamp descending (newest first)
+        rows.sort(key=lambda r: int(r.get("time_stamp", 0)), reverse=True)
+        
+        results = []
+        for row in rows[:10]:
+            ts = int(row.get("time_stamp", 0))
+            dt = datetime.fromtimestamp(ts/1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            
+            results.append({
+                "time": dt,
+                "text": row.get("message_text", "")[:80],
+                "role": row.get("role", "N/A"),
+                "category": row.get("category", "N/A"),
+                "severity": row.get("severity", "N/A"),
+                "issue_id": row.get("issue_id", "none")[:12] + "..." if row.get("issue_id") else "none"
+            })
+        
+        return jsonify({"last_messages": results})
         
     except Exception as e:
         return jsonify({"error": str(e)})
