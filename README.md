@@ -1,4 +1,1 @@
-# workscape-vista
-w vista is an Intelligent incident management system agent for automated detection, classification, and resolution tracking. this is an efficient tool that integrates with zoho ecosystem
-
-
+<img width="798" height="313" alt="final-removebg-preview" src="https://github.com/user-attachments/assets/43281ab7-810c-4605-a25e-203e178f2547" />
