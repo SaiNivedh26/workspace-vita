@@ -7,15 +7,13 @@ import os
 import json
 from datetime import datetime, timezone
 import uuid
-
 import tempfile
 import base64
+import threading
+import time
 
-# Add to existing env vars
-BUCKET_URL = os.getenv("BUCKET_URL")  # Stratus bucket URL
-
-
-
+# ✅ ADD: APScheduler for background token refresh
+from apscheduler.schedulers.background import BackgroundScheduler
 
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
@@ -32,37 +30,135 @@ from google import genai
 app = Flask(__name__)
 app.secret_key = 'YOUR_SECRET_KEY'
 
-# ========= OAuth for Cliq =========
+# ========= OAuth Config =========
 CLIENT_ID = os.getenv('CLIENT_ID')
 CLIENT_SECRET = os.getenv('CLIENT_SECRET')
-
 REDIRECT_URI = 'http://localhost:8000/oauth/callback'
 AUTH_URL = 'https://accounts.zoho.com/oauth/v2/auth'
 TOKEN_URL = 'https://accounts.zoho.com/oauth/v2/token'
-SCOPE = 'ZohoCliq.Channels.READ ZohoCliq.Messages.READ ZohoCliq.Messages.CREATE'
 
-ACCESS_TOKEN = None
-REFRESH_TOKEN = None
+# ========= Catalyst Config =========
+CATALYST_PROJECT_ID = os.getenv("CATALYST_PROJECT_ID")
+CATALYST_ORG_ID = os.getenv("CATALYST_ORG_ID")
+CONVERSATIONS_TABLE = "conversations"
+ISSUES_TABLE = "issues"
 
 # ========= Signals =========
 SIGNALS_EVENT_URL = os.getenv('SIGNALS_EVENT_URL')
-
-# ========= Catalyst Data Store =========
-CATALYST_TOKEN = os.getenv("CATALYST_TOKEN")
-CATALYST_PROJECT_ID = os.getenv("CATALYST_PROJECT_ID")
-CATALYST_ORG_ID = os.getenv("CATALYST_ORG_ID")
-CONVERSATIONS_TABLE = "conversations"  # messages table
-ISSUES_TABLE = "issues"  # issues table (you must create this)
 
 # ========= Qdrant / Gemini =========
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 QDRANT_COLLECTION = "messages_vec"
+BUCKET_URL = os.getenv("BUCKET_URL")
 
 qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
 genai_client = genai.Client()
 
 BOT_NAME = "workspace-vita"
+
+# ✅ TOKEN MANAGER WITH AUTO REFRESH
+class TokenManager:
+    def __init__(self):
+        self.access_token = os.getenv("CATALYST_TOKEN")
+        self.refresh_token = os.getenv("CATALYST_REFRESH_TOKEN")  # Add this to .env
+        self.token_expiry = None
+        self.lock = threading.Lock()
+        
+        print("🔐 Token Manager initialized")
+        if self.refresh_token:
+            print("✅ Refresh token available - auto-refresh enabled")
+        else:
+            print("⚠️ No refresh token - manual token updates required")
+    
+    def get_token(self):
+        """Get current access token"""
+        with self.lock:
+            return self.access_token
+    
+    def refresh_access_token(self):
+        """Refresh access token using refresh token"""
+        if not self.refresh_token:
+            print("❌ No refresh token available, cannot auto-refresh")
+            return False
+        
+        print("🔄 Refreshing access token...")
+        
+        try:
+            data = {
+                "grant_type": "refresh_token",
+                "refresh_token": self.refresh_token,
+                "client_id": CLIENT_ID,
+                "client_secret": CLIENT_SECRET,
+            }
+            
+            resp = requests.post(TOKEN_URL, data=data, timeout=30)
+            
+            if resp.status_code == 200:
+                token_json = resp.json()
+                
+                with self.lock:
+                    self.access_token = token_json.get("access_token")
+                    
+                    # Update refresh token if new one provided
+                    if "refresh_token" in token_json:
+                        self.refresh_token = token_json["refresh_token"]
+                    
+                    # Set expiry (tokens typically last 1 hour)
+                    self.token_expiry = time.time() + 3600
+                
+                print(f"✅ Token refreshed successfully")
+                print(f"   New token: {self.access_token[:20]}...")
+                print(f"   Expires in: 60 minutes")
+                
+                return True
+            else:
+                print(f"❌ Token refresh failed: {resp.status_code}")
+                print(f"   Response: {resp.text[:200]}")
+                return False
+                
+        except Exception as e:
+            print(f"❌ Token refresh exception: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+    
+    def start_auto_refresh(self):
+        """Start background scheduler for automatic token refresh"""
+        if not self.refresh_token:
+            print("⚠️ Auto-refresh disabled (no refresh token)")
+            return
+        
+        scheduler = BackgroundScheduler()
+        
+        # Refresh every 55 minutes (5 min buffer before expiry)
+        scheduler.add_job(
+            func=self.refresh_access_token,
+            trigger="interval",
+            minutes=55,
+            id="token_refresh",
+            name="Auto Token Refresh",
+            replace_existing=True
+        )
+        
+        scheduler.start()
+        print("✅ Auto token refresh scheduled (every 55 minutes)")
+        
+        # Do first refresh immediately if token is old
+        if not self.token_expiry or time.time() > self.token_expiry - 300:
+            print("🔄 Performing initial token refresh...")
+            self.refresh_access_token()
+
+# ✅ Initialize Token Manager
+token_manager = TokenManager()
+
+# ✅ Global getter for token (replaces CATALYST_TOKEN)
+def get_catalyst_token():
+    return token_manager.get_token()
+
+# For backward compatibility, create a property-like access
+CATALYST_TOKEN = property(lambda self: token_manager.get_token())
+
 
 # In-memory issue tracker (for fast access)
 open_issues = {}  # {issue_id: {"opened_at": ts, "title": str, "category": str, "severity": str}}
@@ -210,7 +306,7 @@ def generate_search_query_with_llm(context: str) -> str:
     url = f"https://api.catalyst.zoho.com/quickml/v2/project/{CATALYST_PROJECT_ID}/llm/chat"
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {CATALYST_TOKEN}",
+        "Authorization": f"Bearer {get_catalyst_token()}",
         "CATALYST-ORG": CATALYST_ORG_ID,
     }
     
@@ -278,7 +374,7 @@ def check_resolution_specificity(resolution_text: str) -> dict:
     url = f"https://api.catalyst.zoho.com/quickml/v2/project/{CATALYST_PROJECT_ID}/llm/chat"
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {CATALYST_TOKEN}",
+        "Authorization": f"Bearer {get_catalyst_token()}",
         "CATALYST-ORG": CATALYST_ORG_ID,
     }
     
@@ -353,7 +449,7 @@ def extract_incident_title_from_analysis(analysis: str) -> str:
     url = f"https://api.catalyst.zoho.com/quickml/v2/project/{CATALYST_PROJECT_ID}/llm/chat"
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {CATALYST_TOKEN}",
+        "Authorization": f"Bearer {get_catalyst_token()}",
         "CATALYST-ORG": CATALYST_ORG_ID,
     }
     
@@ -525,7 +621,7 @@ def get_issue_id_from_last_message(conversation_id: str):
 
     url = f"https://api.catalyst.zoho.com/baas/v1/project/{CATALYST_PROJECT_ID}/table/{CONVERSATIONS_TABLE}/row"
     headers = {
-        "Authorization": f"Zoho-oauthtoken {CATALYST_TOKEN}",
+        "Authorization": f"Zoho-oauthtoken {get_catalyst_token()}",
         "CATALYST-ORG": CATALYST_ORG_ID,
     }
 
@@ -573,7 +669,7 @@ def classify_message_llm(text: str) -> dict:
     url = f"https://api.catalyst.zoho.com/quickml/v2/project/{CATALYST_PROJECT_ID}/llm/chat"
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {CATALYST_TOKEN}",
+        "Authorization": f"Bearer {get_catalyst_token()}",
         "CATALYST-ORG": CATALYST_ORG_ID,
     }
     
@@ -680,7 +776,7 @@ def get_latest_open_issue_for_conversation(conversation_id: str):
 
     url = f"https://api.catalyst.zoho.com/baas/v1/project/{CATALYST_PROJECT_ID}/table/{ISSUES_TABLE}/row"
     headers = {
-        "Authorization": f"Zoho-oauthtoken {CATALYST_TOKEN}",
+        "Authorization": f"Zoho-oauthtoken {get_catalyst_token()}",
         "CATALYST-ORG": CATALYST_ORG_ID,
     }
 
@@ -850,7 +946,7 @@ def insert_message_into_datastore(conversation_id, message_id, sender_id, timest
 
     url = f"https://api.catalyst.zoho.com/baas/v1/project/{CATALYST_PROJECT_ID}/table/{CONVERSATIONS_TABLE}/row"
     headers = {
-        "Authorization": f"Zoho-oauthtoken {CATALYST_TOKEN}",
+        "Authorization": f"Zoho-oauthtoken {get_catalyst_token()}",
         "Content-Type": "application/json",
         "CATALYST-ORG": CATALYST_ORG_ID,
     }
@@ -881,7 +977,7 @@ def fetch_messages_by_issue_id(issue_id: str):
 
     url = f"https://api.catalyst.zoho.com/baas/v1/project/{CATALYST_PROJECT_ID}/table/{CONVERSATIONS_TABLE}/row"
     headers = {
-        "Authorization": f"Zoho-oauthtoken {CATALYST_TOKEN}",
+        "Authorization": f"Zoho-oauthtoken {get_catalyst_token()}",
         "CATALYST-ORG": CATALYST_ORG_ID,
     }
 
@@ -946,7 +1042,7 @@ def create_issue_in_datastore(issue_id, title, source, category, severity, opene
 
     url = f"https://api.catalyst.zoho.com/baas/v1/project/{CATALYST_PROJECT_ID}/table/{ISSUES_TABLE}/row"
     headers = {
-        "Authorization": f"Zoho-oauthtoken {CATALYST_TOKEN}",
+        "Authorization": f"Zoho-oauthtoken {get_catalyst_token()}",
         "Content-Type": "application/json",
         "CATALYST-ORG": CATALYST_ORG_ID,
     }
@@ -980,7 +1076,7 @@ def close_issue_in_datastore(issue_id: str, resolved_at_ms: int) -> bool:
 
     base_url = f"https://api.catalyst.zoho.com/baas/v1/project/{CATALYST_PROJECT_ID}/table/{ISSUES_TABLE}/row"
     headers = {
-        "Authorization": f"Zoho-oauthtoken {CATALYST_TOKEN}",
+        "Authorization": f"Zoho-oauthtoken {get_catalyst_token()}",
         "Content-Type": "application/json",
         "CATALYST-ORG": CATALYST_ORG_ID,
     }
@@ -1203,7 +1299,7 @@ def fetch_open_issues():
 
     url = f"https://api.catalyst.zoho.com/baas/v1/project/{CATALYST_PROJECT_ID}/table/{ISSUES_TABLE}/row"
     headers = {
-        "Authorization": f"Zoho-oauthtoken {CATALYST_TOKEN}",
+        "Authorization": f"Zoho-oauthtoken {get_catalyst_token()}",
         "CATALYST-ORG": CATALYST_ORG_ID,
     }
 
@@ -1249,7 +1345,7 @@ def fetch_all_issues():
 
     url = f"https://api.catalyst.zoho.com/baas/v1/project/{CATALYST_PROJECT_ID}/table/{ISSUES_TABLE}/row"
     headers = {
-        "Authorization": f"Zoho-oauthtoken {CATALYST_TOKEN}",
+        "Authorization": f"Zoho-oauthtoken {get_catalyst_token()}",
         "CATALYST-ORG": CATALYST_ORG_ID,
     }
 
@@ -1440,7 +1536,7 @@ def summarize_resolution_with_llm(messages: list, current_resolution_text: str =
     url = f"https://api.catalyst.zoho.com/quickml/v2/project/{CATALYST_PROJECT_ID}/llm/chat"
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {CATALYST_TOKEN}",
+        "Authorization": f"Bearer {get_catalyst_token()}",
         "CATALYST-ORG": CATALYST_ORG_ID,
     }
     
@@ -1538,7 +1634,7 @@ def upload_to_stratus(local_path: str, object_key: str) -> str:
         
         url = f"{BUCKET_URL}/{object_key}"
         headers = {
-            "Authorization": f"Zoho-oauthtoken {CATALYST_TOKEN}",
+            "Authorization": f"Zoho-oauthtoken {get_catalyst_token()}",
             "compress": "false",
             "cache-control": "max-age=3600"
         }
@@ -1567,7 +1663,7 @@ def process_image_with_vision(local_path: str) -> str:
         url = f"https://api.catalyst.zoho.com/quickml/v1/project/{CATALYST_PROJECT_ID}/vlm/chat"
         headers = {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {CATALYST_TOKEN}",
+            "Authorization": f"Bearer {get_catalyst_token()}",
             "CATALYST-ORG": CATALYST_ORG_ID
         }
         
@@ -1606,7 +1702,7 @@ def ocr_document(local_path: str, filename: str) -> str:
     try:
         url = f"https://api.catalyst.zoho.com/baas/v1/project/{CATALYST_PROJECT_ID}/ml/ocr"
         headers = {
-            "Authorization": f"Zoho-oauthtoken {CATALYST_TOKEN}"
+            "Authorization": f"Zoho-oauthtoken {get_catalyst_token()}"
         }
         
         # Determine content type
@@ -4909,7 +5005,7 @@ def store_resolution_summary(issue_id: str, summary: str, resolved_at_ms: int) -
         return False
 
     base_url = f"https://api.catalyst.zoho.com/baas/v1/project/{CATALYST_PROJECT_ID}/table/{ISSUES_TABLE}/row"
-    headers = {"Authorization": f"Zoho-oauthtoken {CATALYST_TOKEN}", "Content-Type": "application/json", "CATALYST-ORG": CATALYST_ORG_ID}
+    headers = {"Authorization": f"Zoho-oauthtoken {get_catalyst_token()}", "Content-Type": "application/json", "CATALYST-ORG": CATALYST_ORG_ID}
 
     try:
         # Find issue ROWID
@@ -4982,7 +5078,7 @@ def debug_qdrant():
         if debug_info["incidents"]:
             url = f"https://api.catalyst.zoho.com/baas/v1/project/{CATALYST_PROJECT_ID}/table/{CONVERSATIONS_TABLE}/row"
             headers = {
-                "Authorization": f"Zoho-oauthtoken {CATALYST_TOKEN}",
+                "Authorization": f"Zoho-oauthtoken {get_catalyst_token()}",
                 "CATALYST-ORG": CATALYST_ORG_ID,
             }
             
@@ -5060,7 +5156,7 @@ def reindex_all():
     
     url = f"https://api.catalyst.zoho.com/baas/v1/project/{CATALYST_PROJECT_ID}/table/{CONVERSATIONS_TABLE}/row"
     headers = {
-        "Authorization": f"Zoho-oauthtoken {CATALYST_TOKEN}",
+        "Authorization": f"Zoho-oauthtoken {get_catalyst_token()}",
         "CATALYST-ORG": CATALYST_ORG_ID,
     }
     
@@ -5145,7 +5241,7 @@ def clear_conversations():
     
     url = f"https://api.catalyst.zoho.com/baas/v1/project/{CATALYST_PROJECT_ID}/table/{CONVERSATIONS_TABLE}/row"
     headers = {
-        "Authorization": f"Zoho-oauthtoken {CATALYST_TOKEN}",
+        "Authorization": f"Zoho-oauthtoken {get_catalyst_token()}",
         "CATALYST-ORG": CATALYST_ORG_ID,
     }
     
@@ -5216,7 +5312,7 @@ def clear_issues():
     
     url = f"https://api.catalyst.zoho.com/baas/v1/project/{CATALYST_PROJECT_ID}/table/{ISSUES_TABLE}/row"
     headers = {
-        "Authorization": f"Zoho-oauthtoken {CATALYST_TOKEN}",
+        "Authorization": f"Zoho-oauthtoken {get_catalyst_token()}",
         "CATALYST-ORG": CATALYST_ORG_ID,
     }
     
@@ -5331,7 +5427,7 @@ def debug_last_messages():
     
     url = f"https://api.catalyst.zoho.com/baas/v1/project/{CATALYST_PROJECT_ID}/table/{CONVERSATIONS_TABLE}/row"
     headers = {
-        "Authorization": f"Zoho-oauthtoken {CATALYST_TOKEN}",
+        "Authorization": f"Zoho-oauthtoken {get_catalyst_token()}",
         "CATALYST-ORG": CATALYST_ORG_ID,
     }
     
@@ -5364,6 +5460,46 @@ def debug_last_messages():
     except Exception as e:
         return jsonify({"error": str(e)})
 
+@app.route('/admin/refresh_token', methods=['POST'])
+def admin_refresh_token():
+    """Manually trigger token refresh"""
+    success = token_manager.refresh_access_token()
+    
+    if success:
+        return jsonify({
+            "status": "success",
+            "message": "Token refreshed",
+            "token_preview": get_catalyst_token()[:20] + "..."
+        })
+    else:
+        return jsonify({
+            "status": "error",
+            "message": "Token refresh failed"
+        }), 500
+
+
+@app.route('/admin/token_status', methods=['GET'])
+def admin_token_status():
+    """Check current token status"""
+    return jsonify({
+        "token_preview": get_catalyst_token()[:20] + "..." if get_catalyst_token() else "NOT SET",
+        "refresh_token_available": bool(token_manager.refresh_token),
+        "auto_refresh_enabled": bool(token_manager.refresh_token)
+    })
+
+
+
 
 if __name__ == '__main__':
-    app.run(port=8000, debug=True)
+    # ✅ Start auto token refresh
+    token_manager.start_auto_refresh()
+    
+    print("\n" + "="*60)
+    print("🚀 Starting Workspace-vita Backend")
+    print("="*60)
+    print(f"📋 Project: {CATALYST_PROJECT_ID}")
+    print(f"🏢 Org: {CATALYST_ORG_ID}")
+    print(f"🔐 Token: {get_catalyst_token()[:20] if get_catalyst_token() else 'NOT SET'}...")
+    print("="*60 + "\n")
+    
+    app.run(port=8000, debug=True, use_reloader=False)  # use_reloader=False important for scheduler
