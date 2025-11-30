@@ -67,6 +67,154 @@ BOT_NAME = "workspace-vita"
 # In-memory issue tracker (for fast access)
 open_issues = {}  # {issue_id: {"opened_at": ts, "title": str, "category": str, "severity": str}}
 
+
+def check_resolution_specificity(resolution_text: str) -> dict:
+    """Use LLM to determine if resolution is vague/generic or specific"""
+    url = f"https://api.catalyst.zoho.com/quickml/v2/project/{CATALYST_PROJECT_ID}/llm/chat"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {CATALYST_TOKEN}",
+        "CATALYST-ORG": CATALYST_ORG_ID,
+    }
+    
+    prompt = f"""Analyze this resolution message and determine if it's VAGUE or SPECIFIC.
+
+Resolution: "{resolution_text}"
+
+VAGUE = Generic statements without mentioning what was fixed (e.g., "fixed", "done", "working now", "issue resolved")
+SPECIFIC = Mentions what was done or what issue was resolved (e.g., "restarted payment gateway", "fixed database timeout", "resolved API connection issue")
+
+Return ONLY this JSON (no extra text):
+{{"specificity": "vague|specific"}}
+
+JSON:"""
+    
+    data = {
+        "prompt": prompt,
+        "model": "crm-di-qwen_text_14b-fp8-it",
+        "system_prompt": "Classify resolution messages as vague or specific. Return ONLY valid JSON.",
+        "temperature": 0.1,
+        "max_tokens": 50,
+    }
+    
+    try:
+        resp = requests.post(url, json=data, headers=headers, timeout=30)
+        
+        if resp.status_code == 200:
+            result = resp.json()
+            
+            # Get output
+            output_text = None
+            if "data" in result and "output_text" in result["data"]:
+                output_text = result["data"]["output_text"]
+            elif "output_text" in result:
+                output_text = result["output_text"]
+            elif "response" in result:
+                output_text = result["response"]
+            
+            if output_text:
+                # Clean and parse JSON
+                output_text = output_text.strip()
+                if "{" in output_text and "}" in output_text:
+                    start = output_text.index("{")
+                    end = output_text.rindex("}") + 1
+                    json_str = output_text[start:end]
+                else:
+                    json_str = output_text
+                
+                parsed = json.loads(json_str)
+                specificity = parsed.get("specificity", "specific")
+                
+                print(f"✅ LLM specificity check: {specificity}")
+                return {"specificity": specificity}
+        
+        # Fallback: assume specific (safer to use similarity)
+        print(f"⚠️ LLM specificity check failed, assuming specific")
+        return {"specificity": "specific"}
+        
+    except Exception as e:
+        print(f"❌ Specificity check error: {e}")
+        # Fallback: assume specific
+        return {"specificity": "specific"}
+
+
+
+
+
+
+
+def extract_incident_title_from_analysis(analysis: str) -> str:
+    """Extract a concise incident title from vision analysis using LLM"""
+    url = f"https://api.catalyst.zoho.com/quickml/v2/project/{CATALYST_PROJECT_ID}/llm/chat"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {CATALYST_TOKEN}",
+        "CATALYST-ORG": CATALYST_ORG_ID,
+    }
+    
+    prompt = f"""Extract the main incident from this analysis as a short title (max 10 words).
+
+Analysis: "{analysis[:300]}"
+
+Return ONLY the incident title, no extra text. Examples:
+- "Production database is down"
+- "Payment gateway connection refused"
+- "API timeout errors"
+
+Title:"""
+    
+    data = {
+        "prompt": prompt,
+        "model": "crm-di-qwen_text_14b-fp8-it",
+        "system_prompt": "Extract concise incident titles. Return only the title, no formatting.",
+        "temperature": 0.2,
+        "max_tokens": 50,
+    }
+    
+    try:
+        resp = requests.post(url, json=data, headers=headers, timeout=30)
+        
+        if resp.status_code == 200:
+            result = resp.json()
+            
+            # Get output
+            output = None
+            if "data" in result and "output_text" in result["data"]:
+                output = result["data"]["output_text"]
+            elif "output_text" in result:
+                output = result["output_text"]
+            elif "response" in result:
+                output = result["response"]
+            
+            if output:
+                title = output.strip().strip('"').strip("'")
+                
+                # Clean up common prefixes
+                for prefix in ["Title:", "Incident:", "Issue:"]:
+                    if title.startswith(prefix):
+                        title = title[len(prefix):].strip()
+                
+                # Limit length
+                if len(title) > 80:
+                    title = title[:77] + "..."
+                
+                print(f"✅ Extracted title: {title}")
+                return title
+        
+        # Fallback: use first sentence of analysis
+        print(f"⚠️ LLM title extraction failed, using fallback")
+        first_sentence = analysis.split('.')[0][:80]
+        return first_sentence if first_sentence else "Incident detected from image"
+        
+    except Exception as e:
+        print(f"❌ Title extraction error: {e}")
+        # Fallback
+        first_sentence = analysis.split('.')[0][:80]
+        return first_sentence if first_sentence else "Incident detected from image"
+
+
+
+
 # ---------- LLM Classification ----------
 # def classify_message_llm(text: str) -> dict:
 #     url = f"https://api.catalyst.zoho.com/quickml/v2/project/{CATALYST_PROJECT_ID}/llm/chat"
@@ -1265,11 +1413,18 @@ def ocr_document(local_path: str, filename: str) -> str:
             content_type = "image/jpeg"
         elif ext == "png":
             content_type = "image/png"
+        elif ext == "webp":
+            content_type = "image/webp"
+        elif ext in ["tiff", "tif"]:
+            content_type = "image/tiff"
+        elif ext == "bmp":
+            content_type = "image/bmp"
         else:
             content_type = "application/octet-stream"
         
-        print(f"📄 OCR for {filename} (type: {content_type})")
+        print(f"📄 OCR for {filename} (type: {content_type}, size: {os.path.getsize(local_path)} bytes)")
         
+        # ✅ FIELD NAME MUST BE "image" (not "file") per docs
         with open(local_path, "rb") as f:
             files = {
                 "image": (filename, f, content_type)
@@ -1284,38 +1439,116 @@ def ocr_document(local_path: str, filename: str) -> str:
         
         if resp.status_code == 200:
             result = resp.json()
-            print(f"OCR result keys: {result.keys()}")
+            print(f"OCR result: {json.dumps(result, indent=2)[:500]}...")
             
-            # Try different response formats
-            text_blocks = result.get("extracted_text", [])
-            
-            if text_blocks:
-                if isinstance(text_blocks, list):
-                    text = " ".join(block.get("text", "") for block in text_blocks if isinstance(block, dict) and block.get("text"))
-                elif isinstance(text_blocks, str):
-                    text = text_blocks
+            # ✅ CORRECT PATH: result -> data -> text
+            if "data" in result and isinstance(result["data"], dict):
+                text = result["data"].get("text", "")
+            elif "extracted_text" in result:
+                # Fallback for older format
+                extracted_text = result.get("extracted_text", [])
+                if isinstance(extracted_text, list):
+                    text = " ".join(
+                        block.get("text", "") if isinstance(block, dict) else str(block)
+                        for block in extracted_text
+                    )
+                elif isinstance(extracted_text, str):
+                    text = extracted_text
                 else:
-                    text = str(text_blocks)
+                    text = ""
             else:
-                # Try alternative key
-                text = result.get("text", "")
+                text = ""
             
-            print(f"OCR extracted {len(text)} characters")
+            # Clean whitespace
+            text = " ".join(text.split())
+            
+            print(f"✓ OCR extracted {len(text)} characters")
             
             if text:
-                return text
-            else:
-                print(f"⚠️ OCR returned empty. Full response: {result}")
-                return ""
+                print(f"📝 First 100 chars: {text[:100]}")
+            
+            return text
         else:
-            print(f"OCR error: {resp.text[:200]}")
+            print(f"❌ OCR failed: {resp.status_code}")
+            print(f"Response: {resp.text[:300]}")
             return ""
             
     except Exception as e:
-        print(f"❌ OCR error: {e}")
+        print(f"❌ OCR exception: {e}")
         import traceback
         traceback.print_exc()
         return ""
+
+
+
+# def ocr_document(local_path: str, filename: str) -> str:
+#     """Run OCR on document/PDF and return extracted text"""
+#     try:
+#         url = f"https://api.catalyst.zoho.com/baas/v1/project/{CATALYST_PROJECT_ID}/ml/ocr"
+#         headers = {
+#             "Authorization": f"Zoho-oauthtoken {CATALYST_TOKEN}"
+#         }
+        
+#         # Determine content type
+#         ext = filename.split(".")[-1].lower() if "." in filename else ""
+        
+#         if ext == "pdf":
+#             content_type = "application/pdf"
+#         elif ext in ["jpg", "jpeg"]:
+#             content_type = "image/jpeg"
+#         elif ext == "png":
+#             content_type = "image/png"
+#         else:
+#             content_type = "application/octet-stream"
+        
+#         print(f"📄 OCR for {filename} (type: {content_type})")
+        
+#         with open(local_path, "rb") as f:
+#             files = {
+#                 "image": (filename, f, content_type)
+#             }
+#             data = {
+#                 "language": "eng"
+#             }
+            
+#             resp = requests.post(url, headers=headers, files=files, data=data, timeout=120)
+        
+#         print(f"OCR response: {resp.status_code}")
+        
+#         if resp.status_code == 200:
+#             result = resp.json()
+#             print(f"OCR result keys: {result.keys()}")
+            
+#             # Try different response formats
+#             text_blocks = result.get("extracted_text", [])
+            
+#             if text_blocks:
+#                 if isinstance(text_blocks, list):
+#                     text = " ".join(block.get("text", "") for block in text_blocks if isinstance(block, dict) and block.get("text"))
+#                 elif isinstance(text_blocks, str):
+#                     text = text_blocks
+#                 else:
+#                     text = str(text_blocks)
+#             else:
+#                 # Try alternative key
+#                 text = result.get("text", "")
+            
+#             print(f"OCR extracted {len(text)} characters")
+            
+#             if text:
+#                 return text
+#             else:
+#                 print(f"⚠️ OCR returned empty. Full response: {result}")
+#                 return ""
+#         else:
+#             print(f"OCR error: {resp.text[:200]}")
+#             return ""
+            
+#     except Exception as e:
+#         print(f"❌ OCR error: {e}")
+#         import traceback
+#         traceback.print_exc()
+#         return ""
 
 
 # def ocr_document(local_path: str, filename: str) -> str:
@@ -1672,48 +1905,6 @@ def index_message(conversation_id, message_id, sender_id, timestamp_ms, message_
     
     issue_id = None
     
-    # 3. Link to issue
-    # if role == "incident":
-    #     # Check for duplicate title
-    #     existing_open = fetch_open_issues()
-    #     normalized_title = message_text.strip().lower()
-    #     for row in existing_open:
-    #         if row.get("title", "").strip().lower() == normalized_title:
-    #             issue_id = row.get("issue_id")
-    #             print(f"🔗 Reusing existing open issue for same title: {issue_id}")
-    #             break
-        
-    #     # If not found, try similarity
-    #     if not issue_id:
-    #         q_filter = Filter(must=[FieldCondition(key="role", match=MatchValue(value="incident"))])
-    #         hits = qdrant.search(
-    #             collection_name=QDRANT_COLLECTION,
-    #             query_vector=emb,
-    #             query_filter=q_filter,
-    #             limit=5,
-    #         )
-    #         open_ids = {r.get("issue_id") for r in existing_open if r.get("issue_id")}
-    #         best_issue_id = None
-    #         best_score = 0.0
-    #         for h in hits:
-    #             if not h.payload:
-    #                 continue
-    #             cand_id = h.payload.get("issue_id")
-    #             if not cand_id or cand_id not in open_ids:
-    #                 continue
-    #             if h.score > best_score and h.score >= 0.75:
-    #                 best_issue_id = cand_id
-    #                 best_score = h.score
-    #         if best_issue_id:
-    #             issue_id = best_issue_id
-    #             print(f"🔗 Linked incident to similar open issue: {issue_id} (score={best_score:.2f})")
-        
-    #     # Create new issue if still no match
-    #     if not issue_id:
-    #         issue_id = str(uuid.uuid4())
-    #         title = message_text[:100] + ("..." if len(message_text) > 100 else "")
-    #         create_issue_in_datastore(issue_id, title, "Cliq", category, severity, timestamp_ms)
-    #         print(f"🆕 Created new issue: {issue_id}")
 
     if role == "incident":
         # ✅ Check for duplicate title (including RECENTLY CLOSED ones)
@@ -1780,32 +1971,13 @@ def index_message(conversation_id, message_id, sender_id, timestamp_ms, message_
 
     
     # elif role in ["discussion", "resolution"]:
-    #     # Link to latest open issue
-    #     latest_open = get_latest_open_issue_for_conversation(conversation_id)
-    #     if latest_open:
-    #         issue_id = latest_open.get("issue_id")
-    #         print(f"🔗 Linked {role} to latest open issue: {issue_id}")
-    #     else:
-    #         print(f"No open issue in DS for conversation {conversation_id}; {role} unlinked.")
-        
-    #     # If resolution, close issue
-    #     if role == "resolution" and issue_id:
-    #         messages = fetch_messages_by_issue_id(issue_id)
-    #         summary = summarize_resolution_with_llm(messages)
-    #         ok = store_resolution_summary(issue_id, summary, timestamp_ms)
-    #         if ok:
-    #             print(f"✅ Closed issue with summary: {issue_id}")
-    #         else:
-    #             print(f"❌ Failed to store resolution summary: {issue_id}")
-
-    # elif role in ["discussion", "resolution"]:
     #     # Try to link to latest open issue
     #     latest_open = get_latest_open_issue_for_conversation(conversation_id)
     #     if latest_open:
     #         issue_id = latest_open.get("issue_id")
     #         print(f"🔗 Linked {role} to latest open issue: {issue_id}")
     #     else:
-    #         # ✅ FALLBACK: Get issue_id from previous message in this conversation
+    #         # Fallback: Get issue_id from previous message
     #         print(f"⚠️ No open issue found, checking previous messages...")
     #         issue_id = get_issue_id_from_last_message(conversation_id)
             
@@ -1814,17 +1986,17 @@ def index_message(conversation_id, message_id, sender_id, timestamp_ms, message_
     #         else:
     #             print(f"❌ No issue_id found; {role} unlinked.")
         
-    #     # ✅ IF RESOLUTION: Generate summary and close issue
+    #     # IF RESOLUTION: Generate summary and close issue
     #     if role == "resolution" and issue_id:
     #         print(f"🔧 Processing resolution for issue {issue_id[:12]}...")
             
-    #         # Fetch all messages for this issue
+    #         # Fetch existing messages
     #         messages = fetch_messages_by_issue_id(issue_id)
-    #         print(f"📥 Found {len(messages)} messages for summary generation")
+    #         print(f"📥 Found {len(messages)} existing messages for summary")
             
-    #         # Generate summary
-    #         summary = summarize_resolution_with_llm(messages)
-    #         print(f"✅ Generated summary: {summary[:80]}...")
+    #         # ✅ Generate summary INCLUDING current resolution message
+    #         summary = summarize_resolution_with_llm(messages, current_resolution_text=message_text)
+    #         print(f"✅ Generated summary: {summary[:100]}...")
             
     #         # Store summary and close issue
     #         ok = store_resolution_summary(issue_id, summary, timestamp_ms)
@@ -1832,40 +2004,287 @@ def index_message(conversation_id, message_id, sender_id, timestamp_ms, message_
     #             print(f"✅ Closed issue {issue_id[:12]} with summary")
     #         else:
     #             print(f"❌ Failed to close issue {issue_id[:12]}")
+
     elif role in ["discussion", "resolution"]:
-        # Try to link to latest open issue
-        latest_open = get_latest_open_issue_for_conversation(conversation_id)
-        if latest_open:
-            issue_id = latest_open.get("issue_id")
-            print(f"🔗 Linked {role} to latest open issue: {issue_id}")
-        else:
-            # Fallback: Get issue_id from previous message
-            print(f"⚠️ No open issue found, checking previous messages...")
-            issue_id = get_issue_id_from_last_message(conversation_id)
-            
-            if issue_id:
-                print(f"🔗 Linked {role} to issue from previous message: {issue_id[:12]}")
-            else:
-                print(f"❌ No issue_id found; {role} unlinked.")
+        # ✅ FOR DISCUSSIONS: Use similarity search to find BEST matching open issue
+        latest_open = None
         
-        # IF RESOLUTION: Generate summary and close issue
-        if role == "resolution" and issue_id:
-            print(f"🔧 Processing resolution for issue {issue_id[:12]}...")
+
+        if role == "discussion":
+            print(f"💬 Discussion detected, finding best matching issue via similarity...")
             
-            # Fetch existing messages
-            messages = fetch_messages_by_issue_id(issue_id)
-            print(f"📥 Found {len(messages)} existing messages for summary")
+            # Get all open issues
+            open_issues = fetch_open_issues()
             
-            # ✅ Generate summary INCLUDING current resolution message
-            summary = summarize_resolution_with_llm(messages, current_resolution_text=message_text)
-            print(f"✅ Generated summary: {summary[:100]}...")
-            
-            # Store summary and close issue
-            ok = store_resolution_summary(issue_id, summary, timestamp_ms)
-            if ok:
-                print(f"✅ Closed issue {issue_id[:12]} with summary")
+            if open_issues:
+                print(f"🔍 Searching across {len(open_issues)} open issue(s)...")
+                
+                # Search for similar incidents/discussions in Qdrant
+                q_filter = Filter(must=[FieldCondition(key="role", match=MatchValue(value="incident"))])
+                hits = qdrant.search(
+                    collection_name=QDRANT_COLLECTION,
+                    query_vector=emb,
+                    query_filter=q_filter,
+                    limit=10,
+                )
+                
+                # Filter to only open issues
+                open_issue_ids = {issue.get("issue_id") for issue in open_issues}
+                
+                best_match = None
+                best_score = 0.0
+                
+                for hit in hits:
+                    if not hit.payload:
+                        continue
+                    candidate_id = hit.payload.get("issue_id")
+                    if candidate_id and candidate_id in open_issue_ids:
+                        if hit.score > best_score:
+                            best_match = candidate_id
+                            best_score = hit.score
+                
+                # ✅ LOWER threshold to 0.55, with fallback to previous message
+                if best_match and best_score >= 0.55:
+                    matched_issue = next((i for i in open_issues if i.get("issue_id") == best_match), None)
+                    issue_id = best_match
+                    print(f"✓ Similarity match found!")
+                    print(f"  Issue ID: {issue_id[:12]}")
+                    print(f"  Score: {best_score:.3f}")
+                    print(f"  Title: {matched_issue.get('title', '')[:60]}")
+                else:
+                    # ✅ FALLBACK: Get from previous message
+                    print(f"⚠️ Low similarity (best: {best_score:.3f}), checking previous message...")
+                    issue_id = get_issue_id_from_last_message(conversation_id)
+                    
+                    if issue_id:
+                        print(f"🔗 Linked to issue from previous message: {issue_id[:12]}")
+                    else:
+                        print(f"❌ No previous message with issue, discussion unlinked")
+                        issue_id = None
             else:
-                print(f"❌ Failed to close issue {issue_id[:12]}")
+                # No open issues - check previous messages
+                print(f"⚠️ No open issues, checking previous messages...")
+                issue_id = get_issue_id_from_last_message(conversation_id)
+                
+                if issue_id:
+                    print(f"🔗 Linked to issue from previous message: {issue_id[:12]}")
+                else:
+                    print(f"❌ No issue found, discussion unlinked")
+                    issue_id = None
+
+        # if role == "discussion":
+        #     print(f"💬 Discussion detected, finding best matching issue via similarity...")
+            
+        #     # Get all open issues
+        #     open_issues = fetch_open_issues()
+            
+        #     if open_issues:
+        #         print(f"🔍 Searching across {len(open_issues)} open issue(s)...")
+                
+        #         # Search for similar incidents/discussions in Qdrant
+        #         q_filter = Filter(must=[FieldCondition(key="role", match=MatchValue(value="incident"))])
+        #         hits = qdrant.search(
+        #             collection_name=QDRANT_COLLECTION,
+        #             query_vector=emb,
+        #             query_filter=q_filter,
+        #             limit=10,
+        #         )
+                
+        #         # Filter to only open issues
+        #         open_issue_ids = {issue.get("issue_id") for issue in open_issues}
+                
+        #         best_match = None
+        #         best_score = 0.0
+                
+        #         for hit in hits:
+        #             if not hit.payload:
+        #                 continue
+        #             candidate_id = hit.payload.get("issue_id")
+        #             if candidate_id and candidate_id in open_issue_ids:
+        #                 if hit.score > best_score:
+        #                     best_match = candidate_id
+        #                     best_score = hit.score
+                
+        #         # ✅ If good match found (>0.60), link to it
+        #         if best_match and best_score >= 0.60:
+        #             matched_issue = next((i for i in open_issues if i.get("issue_id") == best_match), None)
+        #             issue_id = best_match
+        #             print(f"✓ Similarity match found!")
+        #             print(f"  Issue ID: {issue_id[:12]}")
+        #             print(f"  Score: {best_score:.3f}")
+        #             print(f"  Title: {matched_issue.get('title', '')[:80]}")
+        #         else:
+        #             print(f"⚠️ No good match (best score: {best_score:.3f}), discussion unlinked")
+        #             issue_id = None
+        #     else:
+        #         print(f"⚠️ No open issues found, discussion unlinked")
+        #         issue_id = None
+        
+        # elif role == "resolution":
+        #     # ✅ RESOLUTION: Also use similarity, but with fallback to previous message
+        #     print(f"✅ Resolution detected, finding matching issue...")
+            
+        #     # Try similarity first
+        #     open_issues = fetch_open_issues()
+            
+        #     if open_issues:
+        #         print(f"🔍 Searching across {len(open_issues)} open issue(s)...")
+                
+        #         q_filter = Filter(must=[FieldCondition(key="role", match=MatchValue(value="incident"))])
+        #         hits = qdrant.search(
+        #             collection_name=QDRANT_COLLECTION,
+        #             query_vector=emb,
+        #             query_filter=q_filter,
+        #             limit=10,
+        #         )
+                
+        #         open_issue_ids = {issue.get("issue_id") for issue in open_issues}
+                
+        #         best_match = None
+        #         best_score = 0.0
+                
+        #         for hit in hits:
+        #             if not hit.payload:
+        #                 continue
+        #             candidate_id = hit.payload.get("issue_id")
+        #             if candidate_id and candidate_id in open_issue_ids:
+        #                 if hit.score > best_score:
+        #                     best_match = candidate_id
+        #                     best_score = hit.score
+                
+        #         if best_match and best_score >= 0.60:
+        #             matched_issue = next((i for i in open_issues if i.get("issue_id") == best_match), None)
+        #             issue_id = best_match
+        #             print(f"✓ Resolution matched to issue: {issue_id[:12]} (score={best_score:.3f})")
+        #         else:
+        #             # Fallback: Get from previous message
+        #             print(f"⚠️ No similarity match, checking previous messages...")
+        #             issue_id = get_issue_id_from_last_message(conversation_id)
+                    
+        #             if issue_id:
+        #                 print(f"🔗 Linked resolution to issue from previous message: {issue_id[:12]}")
+        #             else:
+        #                 print(f"❌ No issue_id found; resolution unlinked.")
+        #     else:
+        #         # Fallback: Get from previous message
+        #         print(f"⚠️ No open issues, checking previous messages...")
+        #         issue_id = get_issue_id_from_last_message(conversation_id)
+                
+        #         if issue_id:
+        #             print(f"🔗 Linked resolution to issue from previous message: {issue_id[:12]}")
+        #         else:
+        #             print(f"❌ No issue_id found; resolution unlinked.")
+        
+        # # ✅ IF RESOLUTION: Generate summary and close issue
+        # if role == "resolution" and issue_id:
+        #     print(f"🔧 Processing resolution for issue {issue_id[:12]}...")
+            
+        #     # Fetch existing messages
+        #     messages = fetch_messages_by_issue_id(issue_id)
+        #     print(f"📥 Found {len(messages)} existing messages for summary")
+            
+        #     # Generate summary INCLUDING current resolution message
+        #     summary = summarize_resolution_with_llm(messages, current_resolution_text=message_text)
+        #     print(f"✅ Generated summary: {summary[:100]}...")
+            
+        #     # Store summary and close issue
+        #     ok = store_resolution_summary(issue_id, summary, timestamp_ms)
+        #     if ok:
+        #         print(f"✅ Closed issue {issue_id[:12]} with summary")
+        #     else:
+        #         print(f"❌ Failed to close issue {issue_id[:12]}")
+        elif role == "resolution":
+    # ✅ RESOLUTION: Use LLM to check if it's vague or specific
+            print(f"✅ Resolution detected: '{message_text[:60]}...'")
+            
+            specificity = check_resolution_specificity(message_text)
+            is_vague = specificity.get("specificity") == "vague"
+            
+            if is_vague:
+                print(f"🎯 Vague resolution (LLM determined) - using previous message's issue")
+                
+                # Get issue from previous message
+                issue_id = get_issue_id_from_last_message(conversation_id)
+                
+                if issue_id:
+                    print(f"🔗 Resolving issue from previous message: {issue_id[:12]}")
+                else:
+                    print(f"❌ No issue found in previous messages")
+            else:
+                # Specific resolution - use similarity search
+                print(f"🎯 Specific resolution (LLM determined) - using similarity search")
+                
+                open_issues = fetch_open_issues()
+                issue_id = None
+                
+                if open_issues:
+                    print(f"🔍 Searching across {len(open_issues)} open issue(s)...")
+                    
+                    q_filter = Filter(must=[FieldCondition(key="role", match=MatchValue(value="incident"))])
+                    hits = qdrant.search(
+                        collection_name=QDRANT_COLLECTION,
+                        query_vector=emb,
+                        query_filter=q_filter,
+                        limit=10,
+                    )
+                    
+                    open_issue_ids = {issue.get("issue_id") for issue in open_issues}
+                    
+                    best_match = None
+                    best_score = 0.0
+                    
+                    for hit in hits:
+                        if not hit.payload:
+                            continue
+                        candidate_id = hit.payload.get("issue_id")
+                        if candidate_id and candidate_id in open_issue_ids:
+                            if hit.score > best_score:
+                                best_match = candidate_id
+                                best_score = hit.score
+                    
+                    if best_match and best_score >= 0.60:
+                        matched_issue = next((i for i in open_issues if i.get("issue_id") == best_match), None)
+                        issue_id = best_match
+                        print(f"✓ Similarity match: {issue_id[:12]} (score={best_score:.3f})")
+                        print(f"  Matched issue: {matched_issue.get('title', '')[:60]}")
+                    else:
+                        # Fallback: previous message
+                        print(f"⚠️ No similarity match (best: {best_score:.3f}), checking previous messages...")
+                        issue_id = get_issue_id_from_last_message(conversation_id)
+                        
+                        if issue_id:
+                            print(f"🔗 Linked to issue from previous message: {issue_id[:12]}")
+                        else:
+                            print(f"❌ No issue_id found; resolution unlinked")
+                else:
+                    # No open issues - check previous messages
+                    print(f"⚠️ No open issues, checking previous messages...")
+                    issue_id = get_issue_id_from_last_message(conversation_id)
+                    
+                    if issue_id:
+                        print(f"🔗 Linked to issue from previous message: {issue_id[:12]}")
+                    else:
+                        print(f"❌ No issue_id found; resolution unlinked")
+            
+            # ✅ IF RESOLUTION LINKED TO ISSUE: Generate summary and close
+            if issue_id:
+                print(f"🔧 Processing resolution for issue {issue_id[:12]}...")
+                
+                # Fetch existing messages
+                messages = fetch_messages_by_issue_id(issue_id)
+                print(f"📥 Found {len(messages)} existing messages for summary")
+                
+                # Generate summary INCLUDING current resolution message
+                summary = summarize_resolution_with_llm(messages, current_resolution_text=message_text)
+                print(f"✅ Generated summary: {summary[:100]}...")
+                
+                # Store summary and close issue
+                ok = store_resolution_summary(issue_id, summary, timestamp_ms)
+                if ok:
+                    print(f"✅ Closed issue {issue_id[:12]} with summary")
+                else:
+                    print(f"❌ Failed to close issue {issue_id[:12]}")
+
 
     
     # ✅ 4. Store in Data Store (ALWAYS, for ALL roles)
@@ -2676,6 +3095,8 @@ def process_attachment_cliq():
                 print(f"✅ LLM Classification: role={role}, category={category}, severity={severity}")
                 
                 # ✅ IF INCIDENT: Check similarity with ALL open issues FIRST
+                
+                # ✅ IF INCIDENT: Check for RECENT text incident first, then similarity
                 if role == "incident":
                     print("🚨 LLM DETECTED INCIDENT IN IMAGE!")
                     
@@ -2689,44 +3110,80 @@ def process_attachment_cliq():
                     matched_issue_id = None
                     
                     if open_issues:
-                        print(f"🔍 Checking similarity with {len(open_issues)} open issue(s)...")
+                        print(f"🔍 Checking for recent incidents and similarity with {len(open_issues)} open issue(s)...")
                         
-                        # ✅ STEP 2: Search for similar incidents in Qdrant
-                        q_filter = Filter(must=[FieldCondition(key="role", match=MatchValue(value="incident"))])
-                        hits = qdrant.search(
-                            collection_name=QDRANT_COLLECTION,
-                            query_vector=incident_emb,
-                            query_filter=q_filter,
-                            limit=10,
-                        )
+                        # ✅ PRIORITY 1: Check for RECENT incident (within last 2 minutes) with same category
+                        recent_threshold_ms = 2 * 60 * 1000  # 2 minutes
+                        current_time_ms = timestamp_ms
                         
-                        # Get set of open issue IDs
-                        open_issue_ids = {issue.get("issue_id") for issue in open_issues}
-                        
-                        # Find best match among open issues
-                        best_match = None
-                        best_score = 0.0
-                        
-                        for hit in hits:
-                            if not hit.payload:
-                                continue
-                            candidate_id = hit.payload.get("issue_id")
-                            if candidate_id and candidate_id in open_issue_ids:
-                                if hit.score > best_score:
-                                    best_match = candidate_id
-                                    best_score = hit.score
-                        
-                        # ✅ STEP 3: If similarity >= 0.70, link to that issue
-                        if best_match and best_score >= 0.70:
-                            matched_issue = next((i for i in open_issues if i.get("issue_id") == best_match), None)
-                            print(f"✓ High similarity match found!")
-                            print(f"  Issue ID: {best_match[:12]}")
-                            print(f"  Score: {best_score:.3f}")
-                            print(f"  Title: {matched_issue.get('title', '')[:80]}")
+                        recent_matches = []
+                        for issue in open_issues:
+                            opened_at = int(issue.get("opened_at", 0))
+                            time_diff = current_time_ms - opened_at
                             
-                            matched_issue_id = best_match
+                            if time_diff <= recent_threshold_ms and time_diff >= 0:
+                                issue_category = issue.get("category", "").lower()
+                                issue_severity = issue.get("severity", "").lower()
+                                
+                                # Same category or both high severity
+                                if issue_category == category.lower() or (issue_severity == "high" and severity.lower() == "high"):
+                                    recent_matches.append({
+                                        "issue": issue,
+                                        "time_diff": time_diff
+                                    })
+                        
+                        if recent_matches:
+                            # Sort by most recent
+                            recent_matches.sort(key=lambda x: x["time_diff"])
+                            recent_issue = recent_matches[0]["issue"]
+                            matched_issue_id = recent_issue.get("issue_id")
+                            
+                            print(f"🎯 Found RECENT incident ({recent_matches[0]['time_diff']/1000:.0f}s ago)!")
+                            print(f"  Issue ID: {matched_issue_id[:12]}")
+                            print(f"  Title: {recent_issue.get('title', '')[:80]}")
+                            print(f"  Category: {recent_issue.get('category')} (matches: {category})")
+                        
+                        # ✅ PRIORITY 2: If no recent match, use similarity search
+                        if not matched_issue_id:
+                            print("🔍 No recent match, using similarity search...")
+                            
+                            q_filter = Filter(must=[FieldCondition(key="role", match=MatchValue(value="incident"))])
+                            hits = qdrant.search(
+                                collection_name=QDRANT_COLLECTION,
+                                query_vector=incident_emb,
+                                query_filter=q_filter,
+                                limit=10,
+                            )
+                            
+                            # Get set of open issue IDs
+                            open_issue_ids = {issue.get("issue_id") for issue in open_issues}
+                            
+                            # Find best match among open issues
+                            best_match = None
+                            best_score = 0.0
+                            
+                            for hit in hits:
+                                if not hit.payload:
+                                    continue
+                                candidate_id = hit.payload.get("issue_id")
+                                if candidate_id and candidate_id in open_issue_ids:
+                                    if hit.score > best_score:
+                                        best_match = candidate_id
+                                        best_score = hit.score
+                            
+                            # ✅ RAISE threshold to 0.85 for better matching
+                            if best_match and best_score >= 0.85:
+                                matched_issue = next((i for i in open_issues if i.get("issue_id") == best_match), None)
+                                print(f"✓ High similarity match found!")
+                                print(f"  Issue ID: {best_match[:12]}")
+                                print(f"  Score: {best_score:.3f}")
+                                print(f"  Title: {matched_issue.get('title', '')[:80]}")
+                                
+                                matched_issue_id = best_match
+                            else:
+                                print(f"⚠️ No high similarity match (best: {best_score:.3f}, threshold: 0.85)")
                     
-                    # ✅ STEP 4A: If matched, link as discussion to that issue
+                    # ✅ STEP 2: If matched, link as discussion to that issue
                     if matched_issue_id:
                         message_text = f"User shared image showing related incident: {stratus_url}\n\nVision analysis: {analysis}"
                         
@@ -2757,26 +3214,157 @@ def process_attachment_cliq():
                         return jsonify({
                             "status": "linked_to_existing_issue",
                             "issue_id": matched_issue_id[:12],
-                            "similarity_score": round(best_score, 3) if 'best_score' in locals() else None,
+                            "method": "recent_match" if recent_matches else "similarity",
                             "analysis": analysis[:200],
                             "stratus_url": stratus_url
                         })
                     
-                    # ✅ STEP 4B: No match found - create NEW incident
+                    # ✅ STEP 3: No match found - create NEW incident
                     else:
-                        print("🆕 No similar issue found (threshold=0.70), creating new incident")
-                        message_text = f"[Image Analysis - Incident Detected]\n\n{analysis}\n\nImage: {stratus_url}"
+                        print("🆕 No similar issue found, creating new incident")
+                        
+                        # Extract concise title from vision analysis
+                        incident_title = extract_incident_title_from_analysis(analysis)
+                        
+                        message_text = f"{incident_title}\n\n[Image Analysis Details]\n{analysis}\n\nImage: {stratus_url}"
                         
                         # Create new incident using index_message
                         index_message(conversation_id, f"img_{message_id}", sender_id, timestamp_ms, message_text)
                         
                         return jsonify({
                             "status": "incident_created",
+                            "title": incident_title,
                             "analysis": analysis[:200],
                             "category": category,
                             "severity": severity,
                             "stratus_url": stratus_url
                         })
+
+                
+                
+                # if role == "incident":
+                #     print("🚨 LLM DETECTED INCIDENT IN IMAGE!")
+                    
+                #     # Embed the vision analysis
+                #     incident_emb = embed_text(analysis)
+                #     ensure_qdrant_collection(len(incident_emb))
+                    
+                #     # ✅ STEP 1: Get ALL open issues
+                #     open_issues = fetch_open_issues()
+                    
+                #     matched_issue_id = None
+                    
+                #     if open_issues:
+                #         print(f"🔍 Checking similarity with {len(open_issues)} open issue(s)...")
+                        
+                #         # ✅ STEP 2: Search for similar incidents in Qdrant
+                #         q_filter = Filter(must=[FieldCondition(key="role", match=MatchValue(value="incident"))])
+                #         hits = qdrant.search(
+                #             collection_name=QDRANT_COLLECTION,
+                #             query_vector=incident_emb,
+                #             query_filter=q_filter,
+                #             limit=10,
+                #         )
+                        
+                #         # Get set of open issue IDs
+                #         open_issue_ids = {issue.get("issue_id") for issue in open_issues}
+                        
+                #         # Find best match among open issues
+                #         best_match = None
+                #         best_score = 0.0
+                        
+                #         for hit in hits:
+                #             if not hit.payload:
+                #                 continue
+                #             candidate_id = hit.payload.get("issue_id")
+                #             if candidate_id and candidate_id in open_issue_ids:
+                #                 if hit.score > best_score:
+                #                     best_match = candidate_id
+                #                     best_score = hit.score
+                        
+                #         # ✅ STEP 3: If similarity >= 0.70, link to that issue
+                #         if best_match and best_score >= 0.80:
+                #             matched_issue = next((i for i in open_issues if i.get("issue_id") == best_match), None)
+                #             print(f"✓ High similarity match found!")
+                #             print(f"  Issue ID: {best_match[:12]}")
+                #             print(f"  Score: {best_score:.3f}")
+                #             print(f"  Title: {matched_issue.get('title', '')[:80]}")
+                            
+                #             matched_issue_id = best_match
+                    
+                #     # ✅ STEP 4A: If matched, link as discussion to that issue
+                #     if matched_issue_id:
+                #         message_text = f"User shared image showing related incident: {stratus_url}\n\nVision analysis: {analysis}"
+                        
+                #         insert_message_into_datastore(
+                #             conversation_id, f"img_{message_id}", sender_id, timestamp_ms,
+                #             message_text, "discussion", category, severity, matched_issue_id
+                #         )
+                        
+                #         # Index in Qdrant
+                #         qdrant_id = normalize_message_id(f"img_{message_id}")
+                #         point = PointStruct(
+                #             id=qdrant_id,
+                #             vector=incident_emb,
+                #             payload={
+                #                 "conversation_id": conversation_id,
+                #                 "sender_id": sender_id,
+                #                 "role": "discussion",
+                #                 "category": category,
+                #                 "severity": severity,
+                #                 "issue_id": matched_issue_id,
+                #                 "message_id": f"img_{message_id}",
+                #             },
+                #         )
+                #         qdrant.upsert(QDRANT_COLLECTION, [point])
+                        
+                #         print(f"✅ Linked image to existing issue: {matched_issue_id[:12]}")
+                        
+                #         return jsonify({
+                #             "status": "linked_to_existing_issue",
+                #             "issue_id": matched_issue_id[:12],
+                #             "similarity_score": round(best_score, 3) if 'best_score' in locals() else None,
+                #             "analysis": analysis[:200],
+                #             "stratus_url": stratus_url
+                #         })
+                    
+                #     # ✅ STEP 4B: No match found - create NEW incident
+                #     # else:
+                #     #     print("🆕 No similar issue found (threshold=0.70), creating new incident")
+                #     #     message_text = f"[Image Analysis - Incident Detected]\n\n{analysis}\n\nImage: {stratus_url}"
+                        
+                #     #     # Create new incident using index_message
+                #     #     index_message(conversation_id, f"img_{message_id}", sender_id, timestamp_ms, message_text)
+                        
+                #     #     return jsonify({
+                #     #         "status": "incident_created",
+                #     #         "analysis": analysis[:200],
+                #     #         "category": category,
+                #     #         "severity": severity,
+                #     #         "stratus_url": stratus_url
+                #     #     })
+
+                #     # ✅ STEP 4B: No match found - create NEW incident
+                #     else:
+                #         print("🆕 No similar issue found (threshold=0.80), creating new incident")
+                        
+                #         # ✅ Extract concise title from vision analysis
+                #         incident_title = extract_incident_title_from_analysis(analysis)
+                        
+                #         message_text = f"{incident_title}\n\n[Image Analysis Details]\n{analysis}\n\nImage: {stratus_url}"
+                        
+                #         # Create new incident using index_message
+                #         index_message(conversation_id, f"img_{message_id}", sender_id, timestamp_ms, message_text)
+                        
+                #         return jsonify({
+                #             "status": "incident_created",
+                #             "title": incident_title,
+                #             "analysis": analysis[:200],
+                #             "category": category,
+                #             "severity": severity,
+                #             "stratus_url": stratus_url
+                #         })
+
                 
                 else:
                     # ✅ DISCUSSION - Link to latest open issue
@@ -3030,35 +3618,83 @@ def process_attachment_cliq():
                 
                 if ocr_text:
                     print(f"✓ OCR extracted {len(ocr_text)} characters")
+                    print(f"📝 First 100 chars: {ocr_text[:100]}")
                     summary = f"Document '{file_name}' contains: {ocr_text[:300]}..."
                 else:
                     print("⚠️ OCR returned empty, using fallback")
                     summary = f"Document '{file_name}' uploaded (text extraction unavailable)"
                 
-                # ✅ ALWAYS DISCUSSION - Link to open issue if exists
+                # ✅ USE SIMILARITY TO FIND BEST MATCHING ISSUE (not latest)
+                print("🔍 Finding best matching issue for document via similarity...")
+                
+                # Embed the document content
+                doc_emb = embed_text(summary + " " + ocr_text[:500] if ocr_text else summary)
+                ensure_qdrant_collection(len(doc_emb))
+                
+                # Get all open issues
+                open_issues = fetch_open_issues()
+                matched_issue_id = None
+                
+                if open_issues:
+                    print(f"🔍 Checking similarity with {len(open_issues)} open issue(s)...")
+                    
+                    # Search for similar incidents
+                    q_filter = Filter(must=[FieldCondition(key="role", match=MatchValue(value="incident"))])
+                    hits = qdrant.search(
+                        collection_name=QDRANT_COLLECTION,
+                        query_vector=doc_emb,
+                        query_filter=q_filter,
+                        limit=10,
+                    )
+                    
+                    # Filter to only open issues
+                    open_issue_ids = {issue.get("issue_id") for issue in open_issues}
+                    
+                    best_match = None
+                    best_score = 0.0
+                    
+                    for hit in hits:
+                        if not hit.payload:
+                            continue
+                        candidate_id = hit.payload.get("issue_id")
+                        if candidate_id and candidate_id in open_issue_ids:
+                            if hit.score > best_score:
+                                best_match = candidate_id
+                                best_score = hit.score
+                    
+                    # ✅ If good match (>=0.65), link to it
+                    if best_match and best_score >= 0.65:
+                        matched_issue = next((i for i in open_issues if i.get("issue_id") == best_match), None)
+                        matched_issue_id = best_match
+                        print(f"✓ Document matched to issue!")
+                        print(f"  Issue ID: {matched_issue_id[:12]}")
+                        print(f"  Score: {best_score:.3f}")
+                        print(f"  Title: {matched_issue.get('title', '')[:80]}")
+                    else:
+                        print(f"⚠️ No good match (best: {best_score:.3f}), document unlinked")
+                else:
+                    print("⚠️ No open issues, document unlinked")
+                
+                # Store document discussion
                 message_text = f"User shared document: {stratus_url}\n\n{summary}"
                 
-                # Store in DataStore (linked to issue)
                 insert_message_into_datastore(
                     conversation_id, f"doc_{message_id}", sender_id, timestamp_ms,
-                    message_text, "discussion", "other", "low", issue_id
+                    message_text, "discussion", "other", "low", matched_issue_id
                 )
                 
-                # ✅ Index in Qdrant
-                emb = embed_text(message_text)
-                ensure_qdrant_collection(len(emb))
-                
+                # Index in Qdrant
                 qdrant_id = normalize_message_id(f"doc_{message_id}")
                 point = PointStruct(
                     id=qdrant_id,
-                    vector=emb,
+                    vector=doc_emb,
                     payload={
                         "conversation_id": conversation_id,
                         "sender_id": sender_id,
                         "role": "discussion",
                         "category": "other",
                         "severity": "low",
-                        "issue_id": issue_id or "",
+                        "issue_id": matched_issue_id or "",
                         "message_id": f"doc_{message_id}",
                     },
                 )
@@ -3067,9 +3703,57 @@ def process_attachment_cliq():
                 
                 return jsonify({
                     "status": "discussion_created", 
-                    "summary": summary,
-                    "linked_issue": issue_id[:12] if issue_id else None
+                    "summary": summary[:200],
+                    "linked_issue": matched_issue_id[:12] if matched_issue_id else None,
+                    "similarity_score": round(best_score, 3) if 'best_score' in locals() and matched_issue_id else None
                 })
+
+            # elif ext in ("pdf", "doc", "docx", "txt"):
+            #     print("📄 Processing document with OCR...")
+            #     ocr_text = ocr_document(temp_path, file_name)
+                
+            #     if ocr_text:
+            #         print(f"✓ OCR extracted {len(ocr_text)} characters")
+            #         summary = f"Document '{file_name}' contains: {ocr_text[:300]}..."
+            #     else:
+            #         print("⚠️ OCR returned empty, using fallback")
+            #         summary = f"Document '{file_name}' uploaded (text extraction unavailable)"
+                
+            #     # ✅ ALWAYS DISCUSSION - Link to open issue if exists
+            #     message_text = f"User shared document: {stratus_url}\n\n{summary}"
+                
+            #     # Store in DataStore (linked to issue)
+            #     insert_message_into_datastore(
+            #         conversation_id, f"doc_{message_id}", sender_id, timestamp_ms,
+            #         message_text, "discussion", "other", "low", issue_id
+            #     )
+                
+            #     # ✅ Index in Qdrant
+            #     emb = embed_text(message_text)
+            #     ensure_qdrant_collection(len(emb))
+                
+            #     qdrant_id = normalize_message_id(f"doc_{message_id}")
+            #     point = PointStruct(
+            #         id=qdrant_id,
+            #         vector=emb,
+            #         payload={
+            #             "conversation_id": conversation_id,
+            #             "sender_id": sender_id,
+            #             "role": "discussion",
+            #             "category": "other",
+            #             "severity": "low",
+            #             "issue_id": issue_id or "",
+            #             "message_id": f"doc_{message_id}",
+            #         },
+            #     )
+            #     qdrant.upsert(QDRANT_COLLECTION, [point])
+            #     print(f"✅ Indexed document discussion in Qdrant")
+                
+            #     return jsonify({
+            #         "status": "discussion_created", 
+            #         "summary": summary,
+            #         "linked_issue": issue_id[:12] if issue_id else None
+            #     })
             
             else:
                 # ✅ OTHER FILES - Link to issue
