@@ -66,6 +66,211 @@ BOT_NAME = "workspace-vita"
 
 # In-memory issue tracker (for fast access)
 open_issues = {}  # {issue_id: {"opened_at": ts, "title": str, "category": str, "severity": str}}
+@app.route('/quick_fix_past', methods=['GET'])
+def quick_fix_past():
+    """Find similar resolved incidents for quick fixes"""
+    issue_id = request.args.get('issue_id', '').strip()
+    
+    if not issue_id:
+        return jsonify({"error": "No issue_id provided"}), 400
+    
+    print(f"\n🔍 QUICK FIX - PAST FIXES for {issue_id[:12]}...")
+    
+    # Get the issue
+    all_issues = fetch_all_issues()
+    current_issue = next((i for i in all_issues if i.get("issue_id") == issue_id), None)
+    
+    if not current_issue:
+        return jsonify({"error": "Issue not found"}), 404
+    
+    # Get incident message
+    messages = fetch_messages_by_issue_id(issue_id)
+    incident_msg = next((m for m in messages if m.get("role") == "incident"), None)
+    
+    if not incident_msg:
+        return jsonify({"error": "No incident message found"}), 404
+    
+    incident_text = incident_msg.get("message_text", "")
+    
+    # Embed incident
+    incident_emb = embed_text(incident_text)
+    
+    # Search for similar RESOLVED incidents
+    q_filter = Filter(must=[FieldCondition(key="role", match=MatchValue(value="incident"))])
+    hits = qdrant.search(
+        collection_name=QDRANT_COLLECTION,
+        query_vector=incident_emb,
+        query_filter=q_filter,
+        limit=20,
+    )
+    
+    # Filter for resolved issues only (exclude current issue)
+    resolved_issues = [i for i in all_issues if i.get("status", "").lower() == "resolved"]
+    resolved_ids = {i.get("issue_id") for i in resolved_issues}
+    
+    similar_resolved = {}
+    for hit in hits:
+        if not hit.payload:
+            continue
+        candidate_id = hit.payload.get("issue_id")
+        if candidate_id and candidate_id != issue_id and candidate_id in resolved_ids:
+            if hit.score >= 0.60:  # Similarity threshold
+                similar_resolved.setdefault(candidate_id, 0)
+                similar_resolved[candidate_id] = max(similar_resolved[candidate_id], hit.score)
+    
+    # Build results
+    results = []
+    for res_issue_id, score in sorted(similar_resolved.items(), key=lambda x: x[1], reverse=True)[:3]:
+        res_issue = next((i for i in resolved_issues if i.get("issue_id") == res_issue_id), None)
+        if not res_issue:
+            continue
+        
+        resolution = res_issue.get("resolution_summary", "No details")
+        title = res_issue.get("title", "Untitled")[:80]
+        
+        results.append({
+            "issue_id": res_issue_id,
+            "title": title,
+            "resolution": resolution,
+            "similarity": round(score, 2)
+        })
+    
+    print(f"✅ Found {len(results)} similar resolved issues")
+    return jsonify({"results": results, "count": len(results)})
+
+@app.route('/quick_fix_web', methods=['GET'])
+def quick_fix_web():
+    """Generate search query using LLM and search web for fixes"""
+    issue_id = request.args.get('issue_id', '').strip()
+    
+    if not issue_id:
+        return jsonify({"error": "No issue_id provided"}), 400
+    
+    print(f"\n🌐 QUICK FIX - WEB SEARCH for {issue_id[:12]}...")
+    
+    # Get messages for this issue
+    messages = fetch_messages_by_issue_id(issue_id)
+    
+    if not messages:
+        return jsonify({"error": "No messages found"}), 404
+    
+    # Build context from incident + discussions
+    incident_msg = next((m for m in messages if m.get("role") == "incident"), None)
+    discussions = [m.get("message_text", "") for m in messages if m.get("role") == "discussion"][:3]
+    
+    if not incident_msg:
+        return jsonify({"error": "No incident found"}), 404
+    
+    incident_text = incident_msg.get("message_text", "")
+    context = f"Incident: {incident_text}\n"
+    
+    if discussions:
+        context += f"Context: {'; '.join(discussions)}"
+    
+    print(f"📝 Context: {context[:200]}...")
+    
+    # ✅ Use LLM to generate search query
+    search_query = generate_search_query_with_llm(context)
+    
+    if not search_query:
+        return jsonify({"error": "Failed to generate search query"}), 500
+    
+    print(f"🔍 Generated query: {search_query}")
+    
+    # Call Tavily search
+    try:
+        import urllib.parse
+        encoded_query = urllib.parse.quote(search_query)
+        tavily_url = f"https://tavily-search-907381267.development.catalystserverless.com/server/tavily_search_function/execute?query={encoded_query}"
+        
+        resp = requests.get(tavily_url, timeout=30)
+        
+        if resp.status_code == 200:
+            data = resp.json()
+            output = json.loads(data.get("output", "{}"))
+            
+            results = output.get("data", [])
+            print(f"✅ Tavily returned {len(results)} results")
+            
+            return jsonify({
+                "query": search_query,
+                "results": results[:5],
+                "count": len(results)
+            })
+        else:
+            return jsonify({"error": "Tavily search failed"}), 500
+            
+    except Exception as e:
+        print(f"❌ Web search error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+def generate_search_query_with_llm(context: str) -> str:
+    """Use LLM to craft perfect search query from incident context"""
+    url = f"https://api.catalyst.zoho.com/quickml/v2/project/{CATALYST_PROJECT_ID}/llm/chat"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {CATALYST_TOKEN}",
+        "CATALYST-ORG": CATALYST_ORG_ID,
+    }
+    
+    prompt = f"""Generate a concise web search query to find solutions for this IT incident.
+
+Context:
+{context[:500]}
+
+Return ONLY the search query (5-10 words), no explanation. Focus on the error/problem and technology.
+
+Examples:
+- "API Gateway connection refused AWS"
+- "production database timeout PostgreSQL fix"
+- "payment gateway 500 error resolution"
+
+Query:"""
+    
+    data = {
+        "prompt": prompt,
+        "model": "crm-di-qwen_text_14b-fp8-it",
+        "system_prompt": "Generate concise technical search queries for finding solutions to IT issues.",
+        "temperature": 0.3,
+        "max_tokens": 50,
+    }
+    
+    try:
+        resp = requests.post(url, json=data, headers=headers, timeout=30)
+        
+        if resp.status_code == 200:
+            result = resp.json()
+            
+            output = None
+            if "data" in result and "output_text" in result["data"]:
+                output = result["data"]["output_text"]
+            elif "output_text" in result:
+                output = result["output_text"]
+            elif "response" in result:
+                output = result["response"]
+            
+            if output:
+                query = output.strip().strip('"').strip("'")
+                
+                # Clean up
+                for prefix in ["Query:", "Search:"]:
+                    if query.startswith(prefix):
+                        query = query[len(prefix):].strip()
+                
+                return query
+        
+        # Fallback: extract key terms
+        print(f"⚠️ LLM query generation failed, using fallback")
+        words = context.split()[:10]
+        return " ".join(words)
+        
+    except Exception as e:
+        print(f"❌ Query generation error: {e}")
+        # Fallback
+        words = context.split()[:10]
+        return " ".join(words)
+
 
 
 def check_resolution_specificity(resolution_text: str) -> dict:
@@ -4245,94 +4450,303 @@ def issue_conversations_json():
         })
     return jsonify({"messages": out})
 
-
-
 @app.route('/search_incidents_card_json', methods=['GET'])
 def search_incidents_card_json():
-    query = request.args.get("query", "").strip()
+    query = request.args.get('query', '').strip()
+    
     if not query:
         return jsonify({"results": [], "count": 0})
     
-    print(f"\n{'='*60}")
+    print("=" * 60)
     print(f"🔍 SEARCH QUERY: '{query}'")
-    print(f"{'='*60}")
+    print("=" * 60)
     
+    # Embed query
     q_emb = embed_text(query)
-    q_filter = Filter(must=[FieldCondition(key="role", match=MatchValue(value="incident"))])
     
+    # Search for incidents
+    q_filter = Filter(must=[FieldCondition(key="role", match=MatchValue(value="incident"))])
     hits = qdrant.search(
-        collection_name=QDRANT_COLLECTION, 
-        query_vector=q_emb, 
-        query_filter=q_filter, 
+        collection_name=QDRANT_COLLECTION,
+        query_vector=q_emb,
+        query_filter=q_filter,
         limit=20,
     )
     
     print(f"📊 Qdrant returned {len(hits)} hits")
     
-    if hits:
-        print(f"\n🎯 TOP MATCHES:")
-        for i, hit in enumerate(hits[:5], 1):
-            issue_id = hit.payload.get("issue_id", "N/A")[:12]
-            score = hit.score
-            print(f"  #{i}: score={score:.3f} | issue_id={issue_id}")
-    
     if not hits:
         return jsonify({"results": [], "count": 0})
     
+    # ✅ LOWER threshold to 0.50 for better recall
+    filtered_hits = [h for h in hits if h.score >= 0.50]
+    
+    if not filtered_hits:
+        print(f"⚠️ No hits above threshold 0.50")
+        for hit in hits[:5]:
+            print(f"   Score: {hit.score:.3f} - {hit.payload.get('issue_id', 'N/A')[:12] if hit.payload else 'N/A'}")
+        return jsonify({"results": [], "count": 0})
+    
+    print(f"✅ {len(filtered_hits)} hits above threshold 0.50")
+    
+    # Show top scores for debugging
+    for hit in filtered_hits[:5]:
+        print(f"   Score: {hit.score:.3f} - {hit.payload.get('issue_id', 'N/A')[:12] if hit.payload else 'N/A'}")
+    
+    # Group by issue_id
     issue_scores = {}
-    for hit in hits:
+    for hit in filtered_hits:
         if hit.payload and (iid := hit.payload.get("issue_id")):
             issue_scores.setdefault(iid, 0)
             issue_scores[iid] = max(issue_scores[iid], hit.score)
     
+    # Fetch all issues (both open and resolved)
     all_issues = fetch_all_issues()
-    results = []
     
-    for issue_id, score in sorted(issue_scores.items(), key=lambda x: x[1], reverse=True)[:5]:
+    results = []
+    for issue_id, score in sorted(issue_scores.items(), key=lambda x: x[1], reverse=True)[:10]:
         issue = next((i for i in all_issues if i.get("issue_id") == issue_id), None)
         if not issue:
             continue
         
-        # Dates
-        opened_ts = int(issue.get("opened_at", 0))
-        opened_str = datetime.fromtimestamp(opened_ts/1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M") if opened_ts else "N/A"
+        # Get messages
+        messages = fetch_messages_by_issue_id(issue_id)
+        if not messages:
+            continue
         
-        resolved_ts = int(issue.get("resolved_at", 0))
+        # Get incident message
+        incident_msg = next((m for m in messages if m.get("role") == "incident"), None)
+        if not incident_msg:
+            continue
+        
+        title = incident_msg.get("message_text", "Untitled")[:80]
+        category = incident_msg.get("category", "other")
+        severity = incident_msg.get("severity", "low")
+        
+        # Status and dates
         status = issue.get("status", "Open")
+        opened_at = int(issue.get("opened_at", 0))
+        resolved_at = int(issue.get("resolved_at", 0))
         
-        # ✅ Properly format resolved date
-        if resolved_ts > 0 and status.lower() == "resolved":
-            resolved_str = datetime.fromtimestamp(resolved_ts/1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
-        else:
+        try:
+            opened_str = datetime.fromtimestamp(opened_at / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M") if opened_at else "N/A"
+        except:
+            opened_str = "N/A"
+        
+        try:
+            resolved_str = datetime.fromtimestamp(resolved_at / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M") if resolved_at > 0 else "—"
+        except:
             resolved_str = "—"
         
-        # ✅ Get resolution summary (or generate if missing)
-        resolution_summary = issue.get("resolution_summary", "")
-        
-        if status.lower() == "resolved" and not resolution_summary:
-            # Generate summary now if missing
-            messages = fetch_messages_by_issue_id(issue_id)
-            resolution_summary = summarize_resolution_with_llm(messages)
-            print(f"🔧 Generated missing summary for {issue_id[:12]}: {resolution_summary[:50]}")
-        elif status.lower() == "open":
+        # Resolution
+        if status.lower() == "resolved":
+            resolution_summary = issue.get("resolution_summary")
+            if not resolution_summary or resolution_summary.strip() == "":
+                resolution_summary = "Resolved (no details)"
+        else:
             resolution_summary = "🟡 Open - No resolution yet"
-        elif not resolution_summary:
-            resolution_summary = "No resolution recorded"
         
         results.append({
-            "issue_id": issue_id,  # ✅ Include full issue_id for buttons
-            "title": issue.get("title", "Untitled")[:80],
+            "issue_id": issue_id,
+            "title": title,
             "status": status,
-            "category": issue.get("category", "other"),
-            "severity": issue.get("severity", "low"),
+            "category": category,
+            "severity": severity,
             "opened_at": opened_str,
-            "resolved_at": resolved_str,  # ✅ Now shows actual date
+            "resolved_at": resolved_str,
             "resolution_summary": resolution_summary[:150],
             "score": round(score, 2)
         })
     
-    print(f"\n✅ RETURNING {len(results)} results")
+    print(f"✅ RETURNING {len(results)} results")
     return jsonify({"results": results, "count": len(results)})
+
+
+# @app.route('/search_incidents_card_json', methods=['GET'])
+# def search_incidents_card_json():
+#     query = request.args.get('query', '').strip()
+    
+#     if not query:
+#         return jsonify({"results": [], "count": 0})
+    
+#     print("=" * 60)
+#     print(f"🔍 SEARCH QUERY: '{query}'")
+#     print("=" * 60)
+    
+#     # Embed query
+#     q_emb = embed_text(query)
+    
+#     # Search for incidents
+#     q_filter = Filter(must=[FieldCondition(key="role", match=MatchValue(value="incident"))])
+#     hits = qdrant.search(
+#         collection_name=QDRANT_COLLECTION,
+#         query_vector=q_emb,
+#         query_filter=q_filter,
+#         limit=20,
+#     )
+    
+#     print(f"📊 Qdrant returned {len(hits)} hits")
+    
+#     if not hits:
+#         return jsonify({"results": [], "count": 0})
+    
+#     # ✅ Filter hits with minimum score threshold of 0.65
+#     filtered_hits = [h for h in hits if h.score >= 0.65]
+    
+#     if not filtered_hits:
+#         print(f"⚠️ No hits above threshold 0.65")
+#         return jsonify({"results": [], "count": 0})
+    
+#     print(f"✅ {len(filtered_hits)} hits above threshold")
+    
+#     # Group by issue_id
+#     issue_scores = {}
+#     for hit in filtered_hits:
+#         if hit.payload and (iid := hit.payload.get("issue_id")):
+#             issue_scores.setdefault(iid, 0)
+#             issue_scores[iid] = max(issue_scores[iid], hit.score)
+    
+#     # Fetch all issues
+#     all_issues = fetch_all_issues()
+    
+#     results = []
+#     for issue_id, score in sorted(issue_scores.items(), key=lambda x: x[1], reverse=True)[:5]:
+#         issue = next((i for i in all_issues if i.get("issue_id") == issue_id), None)
+#         if not issue:
+#             continue
+        
+#         # Get messages
+#         messages = fetch_messages_by_issue_id(issue_id)
+#         if not messages:
+#             continue
+        
+#         # Get incident message
+#         incident_msg = next((m for m in messages if m.get("role") == "incident"), None)
+#         if not incident_msg:
+#             continue
+        
+#         title = incident_msg.get("message_text", "Untitled")[:80]
+#         category = incident_msg.get("category", "other")
+#         severity = incident_msg.get("severity", "low")
+        
+#         # Status and dates
+#         status = issue.get("status", "Open")
+#         opened_at = int(issue.get("opened_at", 0))
+#         resolved_at = int(issue.get("resolved_at", 0))
+        
+#         opened_str = datetime.fromtimestamp(opened_at / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M") if opened_at else "N/A"
+#         resolved_str = datetime.fromtimestamp(resolved_at / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M") if resolved_at > 0 else "—"
+        
+#         # Resolution
+#         if status.lower() == "resolved":
+#             resolution_summary = issue.get("resolution_summary")
+#             if not resolution_summary:
+#                 resolution_summary = "Resolved (no details)"
+#         else:
+#             resolution_summary = "🟡 Open - No resolution yet"
+        
+#         results.append({
+#             "issue_id": issue_id,
+#             "title": title,
+#             "status": status,
+#             "category": category,
+#             "severity": severity,
+#             "opened_at": opened_str,
+#             "resolved_at": resolved_str,
+#             "resolution_summary": resolution_summary[:150],
+#             "score": round(score, 2)
+#         })
+    
+#     print(f"✅ RETURNING {len(results)} results")
+#     return jsonify({"results": results, "count": len(results)})
+
+
+# @app.route('/search_incidents_card_json', methods=['GET'])
+# def search_incidents_card_json():
+#     query = request.args.get("query", "").strip()
+#     if not query:
+#         return jsonify({"results": [], "count": 0})
+    
+#     print(f"\n{'='*60}")
+#     print(f"🔍 SEARCH QUERY: '{query}'")
+#     print(f"{'='*60}")
+    
+#     q_emb = embed_text(query)
+#     q_filter = Filter(must=[FieldCondition(key="role", match=MatchValue(value="incident"))])
+    
+#     hits = qdrant.search(
+#         collection_name=QDRANT_COLLECTION, 
+#         query_vector=q_emb, 
+#         query_filter=q_filter, 
+#         limit=20,
+#     )
+    
+#     print(f"📊 Qdrant returned {len(hits)} hits")
+    
+#     if hits:
+#         print(f"\n🎯 TOP MATCHES:")
+#         for i, hit in enumerate(hits[:5], 1):
+#             issue_id = hit.payload.get("issue_id", "N/A")[:12]
+#             score = hit.score
+#             print(f"  #{i}: score={score:.3f} | issue_id={issue_id}")
+    
+#     if not hits:
+#         return jsonify({"results": [], "count": 0})
+    
+#     issue_scores = {}
+#     for hit in hits:
+#         if hit.payload and (iid := hit.payload.get("issue_id")):
+#             issue_scores.setdefault(iid, 0)
+#             issue_scores[iid] = max(issue_scores[iid], hit.score)
+    
+#     all_issues = fetch_all_issues()
+#     results = []
+    
+#     for issue_id, score in sorted(issue_scores.items(), key=lambda x: x[1], reverse=True)[:5]:
+#         issue = next((i for i in all_issues if i.get("issue_id") == issue_id), None)
+#         if not issue:
+#             continue
+        
+#         # Dates
+#         opened_ts = int(issue.get("opened_at", 0))
+#         opened_str = datetime.fromtimestamp(opened_ts/1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M") if opened_ts else "N/A"
+        
+#         resolved_ts = int(issue.get("resolved_at", 0))
+#         status = issue.get("status", "Open")
+        
+#         # ✅ Properly format resolved date
+#         if resolved_ts > 0 and status.lower() == "resolved":
+#             resolved_str = datetime.fromtimestamp(resolved_ts/1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+#         else:
+#             resolved_str = "—"
+        
+#         # ✅ Get resolution summary (or generate if missing)
+#         resolution_summary = issue.get("resolution_summary", "")
+        
+#         if status.lower() == "resolved" and not resolution_summary:
+#             # Generate summary now if missing
+#             messages = fetch_messages_by_issue_id(issue_id)
+#             resolution_summary = summarize_resolution_with_llm(messages)
+#             print(f"🔧 Generated missing summary for {issue_id[:12]}: {resolution_summary[:50]}")
+#         elif status.lower() == "open":
+#             resolution_summary = "🟡 Open - No resolution yet"
+#         elif not resolution_summary:
+#             resolution_summary = "No resolution recorded"
+        
+#         results.append({
+#             "issue_id": issue_id,  # ✅ Include full issue_id for buttons
+#             "title": issue.get("title", "Untitled")[:80],
+#             "status": status,
+#             "category": issue.get("category", "other"),
+#             "severity": issue.get("severity", "low"),
+#             "opened_at": opened_str,
+#             "resolved_at": resolved_str,  # ✅ Now shows actual date
+#             "resolution_summary": resolution_summary[:150],
+#             "score": round(score, 2)
+#         })
+    
+#     print(f"\n✅ RETURNING {len(results)} results")
+#     return jsonify({"results": results, "count": len(results)})
 
 
 # @app.route('/search_incidents_card_json', methods=['GET'])
