@@ -1256,20 +1256,57 @@ def ocr_document(local_path: str, filename: str) -> str:
             "Authorization": f"Zoho-oauthtoken {CATALYST_TOKEN}"
         }
         
+        # Determine content type
+        ext = filename.split(".")[-1].lower() if "." in filename else ""
+        
+        if ext == "pdf":
+            content_type = "application/pdf"
+        elif ext in ["jpg", "jpeg"]:
+            content_type = "image/jpeg"
+        elif ext == "png":
+            content_type = "image/png"
+        else:
+            content_type = "application/octet-stream"
+        
+        print(f"📄 OCR for {filename} (type: {content_type})")
+        
         with open(local_path, "rb") as f:
-            files = {"image": (filename, f)}
-            data = {"language": "eng"}
+            files = {
+                "image": (filename, f, content_type)
+            }
+            data = {
+                "language": "eng"
+            }
             
             resp = requests.post(url, headers=headers, files=files, data=data, timeout=120)
         
-        print(f"OCR: {resp.status_code}")
+        print(f"OCR response: {resp.status_code}")
         
         if resp.status_code == 200:
             result = resp.json()
+            print(f"OCR result keys: {result.keys()}")
+            
+            # Try different response formats
             text_blocks = result.get("extracted_text", [])
-            text = " ".join(block.get("text", "") for block in text_blocks if block.get("text"))
+            
+            if text_blocks:
+                if isinstance(text_blocks, list):
+                    text = " ".join(block.get("text", "") for block in text_blocks if isinstance(block, dict) and block.get("text"))
+                elif isinstance(text_blocks, str):
+                    text = text_blocks
+                else:
+                    text = str(text_blocks)
+            else:
+                # Try alternative key
+                text = result.get("text", "")
+            
             print(f"OCR extracted {len(text)} characters")
-            return text
+            
+            if text:
+                return text
+            else:
+                print(f"⚠️ OCR returned empty. Full response: {result}")
+                return ""
         else:
             print(f"OCR error: {resp.text[:200]}")
             return ""
@@ -1279,6 +1316,39 @@ def ocr_document(local_path: str, filename: str) -> str:
         import traceback
         traceback.print_exc()
         return ""
+
+
+# def ocr_document(local_path: str, filename: str) -> str:
+#     """Run OCR on document/PDF and return extracted text"""
+#     try:
+#         url = f"https://api.catalyst.zoho.com/baas/v1/project/{CATALYST_PROJECT_ID}/ml/ocr"
+#         headers = {
+#             "Authorization": f"Zoho-oauthtoken {CATALYST_TOKEN}"
+#         }
+        
+#         with open(local_path, "rb") as f:
+#             files = {"image": (filename, f)}
+#             data = {"language": "eng"}
+            
+#             resp = requests.post(url, headers=headers, files=files, data=data, timeout=120)
+        
+#         print(f"OCR: {resp.status_code}")
+        
+#         if resp.status_code == 200:
+#             result = resp.json()
+#             text_blocks = result.get("extracted_text", [])
+#             text = " ".join(block.get("text", "") for block in text_blocks if block.get("text"))
+#             print(f"OCR extracted {len(text)} characters")
+#             return text
+#         else:
+#             print(f"OCR error: {resp.text[:200]}")
+#             return ""
+            
+#     except Exception as e:
+#         print(f"❌ OCR error: {e}")
+#         import traceback
+#         traceback.print_exc()
+#         return ""
 
 
 def process_attachment(attachment: dict, conversation_id: str, sender_id: str, timestamp_ms: int):
@@ -2536,71 +2606,504 @@ def process_attachment_cliq():
             
             print(f"✓ Uploaded to Stratus: {stratus_url}")
             
+            # ✅ GET LATEST OPEN ISSUE FOR LINKING
+            latest_issue = get_latest_open_issue_for_conversation(conversation_id)
+            issue_id = latest_issue.get("issue_id") if latest_issue else None
+            
+            if issue_id:
+                print(f"🔗 Will link to open issue: {issue_id[:12]}")
+            else:
+                print(f"⚠️ No open issue to link to")
+            
             # Process based on file type
+
             if ext in ("png", "jpg", "jpeg", "bmp", "webp", "gif"):
                 print("🖼️ Processing image with Vision model...")
                 analysis = process_image_with_vision(temp_path)
                 
                 if not analysis:
                     analysis = "Image uploaded (vision analysis unavailable)"
-                
-                print(f"Vision: {analysis[:100]}...")
-                
-                # Check for incident
-                analysis_lower = analysis.lower()
-                incident_keywords = ["error", "failed", "down", "outage", "critical", 
-                                    "production", "timeout", "crash", "exception", "database"]
-                
-                is_incident = any(kw in analysis_lower for kw in incident_keywords)
-                
-                if is_incident and "no incident" not in analysis_lower:
-                    print("🚨 INCIDENT DETECTED IN IMAGE!")
-                    message_text = f"[Image Analysis] {analysis}"
-                    index_message(conversation_id, f"img_{message_id}", sender_id, timestamp_ms, message_text)
+                    print("⚠️ Vision model returned empty, treating as discussion")
                     
-                    return jsonify({
-                        "status": "incident_created",
-                        "analysis": analysis,
-                        "stratus_url": stratus_url
-                    })
-                else:
-                    print("💬 Image stored as discussion")
-                    message_text = f"User shared image: {stratus_url}\n\nVision analysis: {analysis}"
+                    # Get latest issue for linking discussions
+                    latest_issue = get_latest_open_issue_for_conversation(conversation_id)
+                    issue_id = latest_issue.get("issue_id") if latest_issue else None
+                    
+                    # Store as discussion
+                    message_text = f"User shared image: {stratus_url}\n\nVision analysis unavailable."
+                    
                     insert_message_into_datastore(
                         conversation_id, f"img_{message_id}", sender_id, timestamp_ms,
-                        message_text, "discussion", "other", "low", None
+                        message_text, "discussion", "other", "low", issue_id
                     )
+                    
+                    # Index in Qdrant
+                    emb = embed_text(message_text)
+                    ensure_qdrant_collection(len(emb))
+                    
+                    qdrant_id = normalize_message_id(f"img_{message_id}")
+                    point = PointStruct(
+                        id=qdrant_id,
+                        vector=emb,
+                        payload={
+                            "conversation_id": conversation_id,
+                            "sender_id": sender_id,
+                            "role": "discussion",
+                            "category": "other",
+                            "severity": "low",
+                            "issue_id": issue_id or "",
+                            "message_id": f"img_{message_id}",
+                        },
+                    )
+                    qdrant.upsert(QDRANT_COLLECTION, [point])
                     
                     return jsonify({
                         "status": "discussion_created",
-                        "analysis": analysis
+                        "analysis": "Vision analysis unavailable",
+                        "linked_issue": issue_id[:12] if issue_id else None
                     })
+                
+                print(f"Vision analysis: {analysis[:150]}...")
+                
+                # ✅ USE LLM TO CLASSIFY THE VISION ANALYSIS OUTPUT
+                print("🤖 Classifying vision analysis with LLM...")
+                classification = classify_message_llm(analysis)
+                
+                role = classification.get("role", "discussion")
+                category = classification.get("category", "other")
+                severity = classification.get("severity", "low")
+                
+                print(f"✅ LLM Classification: role={role}, category={category}, severity={severity}")
+                
+                # ✅ IF INCIDENT: Check similarity with ALL open issues FIRST
+                if role == "incident":
+                    print("🚨 LLM DETECTED INCIDENT IN IMAGE!")
+                    
+                    # Embed the vision analysis
+                    incident_emb = embed_text(analysis)
+                    ensure_qdrant_collection(len(incident_emb))
+                    
+                    # ✅ STEP 1: Get ALL open issues
+                    open_issues = fetch_open_issues()
+                    
+                    matched_issue_id = None
+                    
+                    if open_issues:
+                        print(f"🔍 Checking similarity with {len(open_issues)} open issue(s)...")
+                        
+                        # ✅ STEP 2: Search for similar incidents in Qdrant
+                        q_filter = Filter(must=[FieldCondition(key="role", match=MatchValue(value="incident"))])
+                        hits = qdrant.search(
+                            collection_name=QDRANT_COLLECTION,
+                            query_vector=incident_emb,
+                            query_filter=q_filter,
+                            limit=10,
+                        )
+                        
+                        # Get set of open issue IDs
+                        open_issue_ids = {issue.get("issue_id") for issue in open_issues}
+                        
+                        # Find best match among open issues
+                        best_match = None
+                        best_score = 0.0
+                        
+                        for hit in hits:
+                            if not hit.payload:
+                                continue
+                            candidate_id = hit.payload.get("issue_id")
+                            if candidate_id and candidate_id in open_issue_ids:
+                                if hit.score > best_score:
+                                    best_match = candidate_id
+                                    best_score = hit.score
+                        
+                        # ✅ STEP 3: If similarity >= 0.70, link to that issue
+                        if best_match and best_score >= 0.70:
+                            matched_issue = next((i for i in open_issues if i.get("issue_id") == best_match), None)
+                            print(f"✓ High similarity match found!")
+                            print(f"  Issue ID: {best_match[:12]}")
+                            print(f"  Score: {best_score:.3f}")
+                            print(f"  Title: {matched_issue.get('title', '')[:80]}")
+                            
+                            matched_issue_id = best_match
+                    
+                    # ✅ STEP 4A: If matched, link as discussion to that issue
+                    if matched_issue_id:
+                        message_text = f"User shared image showing related incident: {stratus_url}\n\nVision analysis: {analysis}"
+                        
+                        insert_message_into_datastore(
+                            conversation_id, f"img_{message_id}", sender_id, timestamp_ms,
+                            message_text, "discussion", category, severity, matched_issue_id
+                        )
+                        
+                        # Index in Qdrant
+                        qdrant_id = normalize_message_id(f"img_{message_id}")
+                        point = PointStruct(
+                            id=qdrant_id,
+                            vector=incident_emb,
+                            payload={
+                                "conversation_id": conversation_id,
+                                "sender_id": sender_id,
+                                "role": "discussion",
+                                "category": category,
+                                "severity": severity,
+                                "issue_id": matched_issue_id,
+                                "message_id": f"img_{message_id}",
+                            },
+                        )
+                        qdrant.upsert(QDRANT_COLLECTION, [point])
+                        
+                        print(f"✅ Linked image to existing issue: {matched_issue_id[:12]}")
+                        
+                        return jsonify({
+                            "status": "linked_to_existing_issue",
+                            "issue_id": matched_issue_id[:12],
+                            "similarity_score": round(best_score, 3) if 'best_score' in locals() else None,
+                            "analysis": analysis[:200],
+                            "stratus_url": stratus_url
+                        })
+                    
+                    # ✅ STEP 4B: No match found - create NEW incident
+                    else:
+                        print("🆕 No similar issue found (threshold=0.70), creating new incident")
+                        message_text = f"[Image Analysis - Incident Detected]\n\n{analysis}\n\nImage: {stratus_url}"
+                        
+                        # Create new incident using index_message
+                        index_message(conversation_id, f"img_{message_id}", sender_id, timestamp_ms, message_text)
+                        
+                        return jsonify({
+                            "status": "incident_created",
+                            "analysis": analysis[:200],
+                            "category": category,
+                            "severity": severity,
+                            "stratus_url": stratus_url
+                        })
+                
+                else:
+                    # ✅ DISCUSSION - Link to latest open issue
+                    latest_issue = get_latest_open_issue_for_conversation(conversation_id)
+                    issue_id = latest_issue.get("issue_id") if latest_issue else None
+                    
+                    print(f"💬 Image classified as {role}")
+                    if issue_id:
+                        print(f"🔗 Linking to latest open issue: {issue_id[:12]}")
+                    
+                    message_text = f"User shared image: {stratus_url}\n\nVision analysis: {analysis}"
+                    
+                    # Store in DataStore
+                    insert_message_into_datastore(
+                        conversation_id, f"img_{message_id}", sender_id, timestamp_ms,
+                        message_text, role, category, severity, issue_id
+                    )
+                    
+                    # Index in Qdrant
+                    emb = embed_text(message_text)
+                    ensure_qdrant_collection(len(emb))
+                    
+                    qdrant_id = normalize_message_id(f"img_{message_id}")
+                    point = PointStruct(
+                        id=qdrant_id,
+                        vector=emb,
+                        payload={
+                            "conversation_id": conversation_id,
+                            "sender_id": sender_id,
+                            "role": role,
+                            "category": category,
+                            "severity": severity,
+                            "issue_id": issue_id or "",
+                            "message_id": f"img_{message_id}",
+                        },
+                    )
+                    qdrant.upsert(QDRANT_COLLECTION, [point])
+                    print(f"✅ Indexed image {role} in Qdrant")
+                    
+                    return jsonify({
+                        "status": f"{role}_created",
+                        "analysis": analysis[:200],
+                        "category": category,
+                        "severity": severity,
+                        "linked_issue": issue_id[:12] if issue_id else None
+                    })
+
+            # if ext in ("png", "jpg", "jpeg", "bmp", "webp", "gif"):
+            #     print("🖼️ Processing image with Vision model...")
+            #     analysis = process_image_with_vision(temp_path)
+                
+            #     if not analysis:
+            #         analysis = "Image uploaded (vision analysis unavailable)"
+            #         print("⚠️ Vision model returned empty, treating as discussion")
+                    
+            #         # Store as discussion
+            #         message_text = f"User shared image: {stratus_url}\n\nVision analysis unavailable."
+                    
+            #         insert_message_into_datastore(
+            #             conversation_id, f"img_{message_id}", sender_id, timestamp_ms,
+            #             message_text, "discussion", "other", "low", issue_id
+            #         )
+                    
+            #         # Index in Qdrant
+            #         emb = embed_text(message_text)
+            #         ensure_qdrant_collection(len(emb))
+                    
+            #         qdrant_id = normalize_message_id(f"img_{message_id}")
+            #         point = PointStruct(
+            #             id=qdrant_id,
+            #             vector=emb,
+            #             payload={
+            #                 "conversation_id": conversation_id,
+            #                 "sender_id": sender_id,
+            #                 "role": "discussion",
+            #                 "category": "other",
+            #                 "severity": "low",
+            #                 "issue_id": issue_id or "",
+            #                 "message_id": f"img_{message_id}",
+            #             },
+            #         )
+            #         qdrant.upsert(QDRANT_COLLECTION, [point])
+                    
+            #         return jsonify({
+            #             "status": "discussion_created",
+            #             "analysis": "Vision analysis unavailable",
+            #             "linked_issue": issue_id[:12] if issue_id else None
+            #         })
+                
+            #     print(f"Vision analysis: {analysis[:150]}...")
+                
+            #     # ✅ USE LLM TO CLASSIFY THE VISION ANALYSIS OUTPUT
+            #     print("🤖 Classifying vision analysis with LLM...")
+            #     classification = classify_message_llm(analysis)
+                
+            #     role = classification.get("role", "discussion")
+            #     category = classification.get("category", "other")
+            #     severity = classification.get("severity", "low")
+                
+            #     print(f"✅ LLM Classification: role={role}, category={category}, severity={severity}")
+                
+            #     # ✅ CREATE INCIDENT ONLY IF LLM CLASSIFIES AS INCIDENT
+            #     # if role == "incident":
+            #     #     print("🚨 LLM DETECTED INCIDENT IN IMAGE!")
+            #     #     message_text = f"[Image Analysis - Incident Detected]\n\n{analysis}\n\nImage: {stratus_url}"
+                    
+            #     #     # Use index_message to create incident (handles issue creation)
+            #     #     index_message(conversation_id, f"img_{message_id}", sender_id, timestamp_ms, message_text)
+                    
+            #     #     return jsonify({
+            #     #         "status": "incident_created",
+            #     #         "analysis": analysis,
+            #     #         "category": category,
+            #     #         "severity": severity,
+            #     #         "stratus_url": stratus_url
+            #     #     })
+            #     # ✅ CREATE INCIDENT ONLY IF LLM CLASSIFIES AS INCIDENT
+            #     if role == "incident":
+            #         print("🚨 LLM DETECTED INCIDENT IN IMAGE!")
+            #         message_text = f"[Image Analysis - Incident Detected]\n\n{analysis}\n\nImage: {stratus_url}"
+                    
+            #         # ✅ CHECK IF THIS INCIDENT IS SIMILAR TO ANY EXISTING OPEN ISSUE
+            #         print("🔍 Checking similarity with existing open issues...")
+                    
+            #         # Embed the vision analysis
+            #         incident_emb = embed_text(analysis)
+            #         ensure_qdrant_collection(len(incident_emb))
+                    
+            #         # Get all open issues
+            #         open_issues = fetch_open_issues()
+                    
+            #         if open_issues:
+            #             # Search for similar incidents in Qdrant
+            #             q_filter = Filter(must=[FieldCondition(key="role", match=MatchValue(value="incident"))])
+            #             hits = qdrant.search(
+            #                 collection_name=QDRANT_COLLECTION,
+            #                 query_vector=incident_emb,
+            #                 query_filter=q_filter,
+            #                 limit=10,
+            #             )
+                        
+            #             # Filter hits to only include open issues
+            #             open_issue_ids = {issue.get("issue_id") for issue in open_issues}
+                        
+            #             best_match = None
+            #             best_score = 0.0
+                        
+            #             for hit in hits:
+            #                 if not hit.payload:
+            #                     continue
+            #                 candidate_id = hit.payload.get("issue_id")
+            #                 if candidate_id and candidate_id in open_issue_ids:
+            #                     if hit.score > best_score:
+            #                         best_match = candidate_id
+            #                         best_score = hit.score
+                        
+            #             # ✅ If high similarity found (>0.70), link to existing issue instead of creating new one
+            #             if best_match and best_score >= 0.70:
+            #                 matched_issue = next((i for i in open_issues if i.get("issue_id") == best_match), None)
+            #                 print(f"🔗 High similarity found! Linking to existing issue: {best_match[:12]} (score={best_score:.3f})")
+            #                 print(f"   Matched issue: {matched_issue.get('title', '')[:60]}")
+                            
+            #                 # Store as discussion linked to the matched issue
+            #                 message_text_linked = f"User shared image showing related incident: {stratus_url}\n\nVision analysis: {analysis}"
+                            
+            #                 insert_message_into_datastore(
+            #                     conversation_id, f"img_{message_id}", sender_id, timestamp_ms,
+            #                     message_text_linked, "discussion", category, severity, best_match
+            #                 )
+                            
+            #                 # Index in Qdrant
+            #                 qdrant_id = normalize_message_id(f"img_{message_id}")
+            #                 point = PointStruct(
+            #                     id=qdrant_id,
+            #                     vector=incident_emb,
+            #                     payload={
+            #                         "conversation_id": conversation_id,
+            #                         "sender_id": sender_id,
+            #                         "role": "discussion",
+            #                         "category": category,
+            #                         "severity": severity,
+            #                         "issue_id": best_match,
+            #                         "message_id": f"img_{message_id}",
+            #                     },
+            #                 )
+            #                 qdrant.upsert(QDRANT_COLLECTION, [point])
+                            
+            #                 return jsonify({
+            #                     "status": "linked_to_existing_issue",
+            #                     "issue_id": best_match[:12],
+            #                     "similarity_score": round(best_score, 3),
+            #                     "analysis": analysis,
+            #                     "stratus_url": stratus_url
+            #                 })
+                    
+            #         # ✅ No similar issue found - create new incident
+            #         print("🆕 No similar issue found, creating new incident")
+            #         index_message(conversation_id, f"img_{message_id}", sender_id, timestamp_ms, message_text)
+                    
+            #         return jsonify({
+            #             "status": "incident_created",
+            #             "analysis": analysis,
+            #             "category": category,
+            #             "severity": severity,
+            #             "stratus_url": stratus_url
+            #         })
+
+            #     else:
+            #         # ✅ DISCUSSION - Link to open issue if exists
+            #         print(f"💬 Image stored as {role}")
+            #         message_text = f"User shared image: {stratus_url}\n\nVision analysis: {analysis}"
+                    
+            #         # Store in DataStore (linked to issue if exists)
+            #         insert_message_into_datastore(
+            #             conversation_id, f"img_{message_id}", sender_id, timestamp_ms,
+            #             message_text, role, category, severity, issue_id
+            #         )
+                    
+            #         # ✅ Index in Qdrant
+            #         emb = embed_text(message_text)
+            #         ensure_qdrant_collection(len(emb))
+                    
+            #         qdrant_id = normalize_message_id(f"img_{message_id}")
+            #         point = PointStruct(
+            #             id=qdrant_id,
+            #             vector=emb,
+            #             payload={
+            #                 "conversation_id": conversation_id,
+            #                 "sender_id": sender_id,
+            #                 "role": role,
+            #                 "category": category,
+            #                 "severity": severity,
+            #                 "issue_id": issue_id or "",
+            #                 "message_id": f"img_{message_id}",
+            #             },
+            #         )
+            #         qdrant.upsert(QDRANT_COLLECTION, [point])
+            #         print(f"✅ Indexed image {role} in Qdrant")
+                    
+            #         return jsonify({
+            #             "status": f"{role}_created",
+            #             "analysis": analysis,
+            #             "category": category,
+            #             "severity": severity,
+            #             "linked_issue": issue_id[:12] if issue_id else None
+            #         })
             
             elif ext in ("pdf", "doc", "docx", "txt"):
                 print("📄 Processing document with OCR...")
                 ocr_text = ocr_document(temp_path, file_name)
                 
                 if ocr_text:
-                    summary = f"Document '{file_name}' contains: {ocr_text[:200]}..."
+                    print(f"✓ OCR extracted {len(ocr_text)} characters")
+                    summary = f"Document '{file_name}' contains: {ocr_text[:300]}..."
                 else:
-                    summary = f"Document '{file_name}' uploaded"
+                    print("⚠️ OCR returned empty, using fallback")
+                    summary = f"Document '{file_name}' uploaded (text extraction unavailable)"
                 
+                # ✅ ALWAYS DISCUSSION - Link to open issue if exists
                 message_text = f"User shared document: {stratus_url}\n\n{summary}"
+                
+                # Store in DataStore (linked to issue)
                 insert_message_into_datastore(
                     conversation_id, f"doc_{message_id}", sender_id, timestamp_ms,
-                    message_text, "discussion", "other", "low", None
+                    message_text, "discussion", "other", "low", issue_id
                 )
                 
-                return jsonify({"status": "discussion_created", "summary": summary})
+                # ✅ Index in Qdrant
+                emb = embed_text(message_text)
+                ensure_qdrant_collection(len(emb))
+                
+                qdrant_id = normalize_message_id(f"doc_{message_id}")
+                point = PointStruct(
+                    id=qdrant_id,
+                    vector=emb,
+                    payload={
+                        "conversation_id": conversation_id,
+                        "sender_id": sender_id,
+                        "role": "discussion",
+                        "category": "other",
+                        "severity": "low",
+                        "issue_id": issue_id or "",
+                        "message_id": f"doc_{message_id}",
+                    },
+                )
+                qdrant.upsert(QDRANT_COLLECTION, [point])
+                print(f"✅ Indexed document discussion in Qdrant")
+                
+                return jsonify({
+                    "status": "discussion_created", 
+                    "summary": summary,
+                    "linked_issue": issue_id[:12] if issue_id else None
+                })
             
             else:
+                # ✅ OTHER FILES - Link to issue
                 message_text = f"User shared file: {file_name} ({stratus_url})"
+                
                 insert_message_into_datastore(
                     conversation_id, f"file_{message_id}", sender_id, timestamp_ms,
-                    message_text, "discussion", "other", "low", None
+                    message_text, "discussion", "other", "low", issue_id
                 )
                 
-                return jsonify({"status": "discussion_created"})
+                # Index in Qdrant
+                emb = embed_text(message_text)
+                ensure_qdrant_collection(len(emb))
+                
+                qdrant_id = normalize_message_id(f"file_{message_id}")
+                point = PointStruct(
+                    id=qdrant_id,
+                    vector=emb,
+                    payload={
+                        "conversation_id": conversation_id,
+                        "sender_id": sender_id,
+                        "role": "discussion",
+                        "category": "other",
+                        "severity": "low",
+                        "issue_id": issue_id or "",
+                        "message_id": f"file_{message_id}",
+                    },
+                )
+                qdrant.upsert(QDRANT_COLLECTION, [point])
+                
+                return jsonify({
+                    "status": "discussion_created",
+                    "linked_issue": issue_id[:12] if issue_id else None
+                })
         
         finally:
             if os.path.exists(temp_path):
@@ -2612,6 +3115,134 @@ def process_attachment_cliq():
         import traceback
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+
+
+
+
+# @app.route('/process_attachment_cliq', methods=['POST'])
+# def process_attachment_cliq():
+#     """Process attachment from Cliq Participation Handler (URL-based)"""
+#     try:
+#         print("\n" + "="*60)
+#         print("📎 CLIQ ATTACHMENT RECEIVED")
+#         print("="*60)
+        
+#         # Get parameters
+#         file_url = request.form.get('file_url')
+#         file_name = request.form.get('file_name', f'attachment_{uuid.uuid4()}')
+#         conversation_id = request.form.get('conversation_id')
+#         sender_id = request.form.get('sender_id')
+#         timestamp_ms = int(request.form.get('timestamp', 0))
+#         message_id = request.form.get('message_id')
+        
+#         print(f"File: {file_name}")
+#         print(f"URL: {file_url[:80]}...")
+#         print(f"Conversation: {conversation_id}")
+        
+#         if not file_url:
+#             return jsonify({"error": "No file URL"}), 400
+        
+#         # Download file from Cliq
+#         ext = file_name.split(".")[-1].lower() if "." in file_name else "bin"
+#         temp_path = tempfile.mktemp(suffix=f".{ext}")
+        
+#         print(f"⬇️ Downloading from Cliq...")
+#         resp = requests.get(file_url, stream=True, timeout=60)
+        
+#         with open(temp_path, "wb") as f:
+#             for chunk in resp.iter_content(chunk_size=1024*1024):
+#                 if chunk:
+#                     f.write(chunk)
+        
+#         file_size = os.path.getsize(temp_path)
+#         print(f"✓ Downloaded {file_size} bytes")
+        
+#         try:
+#             # Upload to Stratus
+#             stratus_key = f"attachments/{message_id}_{file_name}"
+#             stratus_url = upload_to_stratus(temp_path, stratus_key)
+            
+#             if not stratus_url:
+#                 return jsonify({"error": "Stratus upload failed"}), 500
+            
+#             print(f"✓ Uploaded to Stratus: {stratus_url}")
+            
+#             # Process based on file type
+#             if ext in ("png", "jpg", "jpeg", "bmp", "webp", "gif"):
+#                 print("🖼️ Processing image with Vision model...")
+#                 analysis = process_image_with_vision(temp_path)
+                
+#                 if not analysis:
+#                     analysis = "Image uploaded (vision analysis unavailable)"
+                
+#                 print(f"Vision: {analysis[:100]}...")
+                
+#                 # Check for incident
+#                 analysis_lower = analysis.lower()
+#                 incident_keywords = ["error", "failed", "down", "outage", "critical", 
+#                                     "production", "timeout", "crash", "exception", "database"]
+                
+#                 is_incident = any(kw in analysis_lower for kw in incident_keywords)
+                
+#                 if is_incident and "no incident" not in analysis_lower:
+#                     print("🚨 INCIDENT DETECTED IN IMAGE!")
+#                     message_text = f"[Image Analysis] {analysis}"
+#                     index_message(conversation_id, f"img_{message_id}", sender_id, timestamp_ms, message_text)
+                    
+#                     return jsonify({
+#                         "status": "incident_created",
+#                         "analysis": analysis,
+#                         "stratus_url": stratus_url
+#                     })
+#                 else:
+#                     print("💬 Image stored as discussion")
+#                     message_text = f"User shared image: {stratus_url}\n\nVision analysis: {analysis}"
+#                     insert_message_into_datastore(
+#                         conversation_id, f"img_{message_id}", sender_id, timestamp_ms,
+#                         message_text, "discussion", "other", "low", None
+#                     )
+                    
+#                     return jsonify({
+#                         "status": "discussion_created",
+#                         "analysis": analysis
+#                     })
+            
+#             elif ext in ("pdf", "doc", "docx", "txt"):
+#                 print("📄 Processing document with OCR...")
+#                 ocr_text = ocr_document(temp_path, file_name)
+                
+#                 if ocr_text:
+#                     summary = f"Document '{file_name}' contains: {ocr_text[:200]}..."
+#                 else:
+#                     summary = f"Document '{file_name}' uploaded"
+                
+#                 message_text = f"User shared document: {stratus_url}\n\n{summary}"
+#                 insert_message_into_datastore(
+#                     conversation_id, f"doc_{message_id}", sender_id, timestamp_ms,
+#                     message_text, "discussion", "other", "low", None
+#                 )
+                
+#                 return jsonify({"status": "discussion_created", "summary": summary})
+            
+#             else:
+#                 message_text = f"User shared file: {file_name} ({stratus_url})"
+#                 insert_message_into_datastore(
+#                     conversation_id, f"file_{message_id}", sender_id, timestamp_ms,
+#                     message_text, "discussion", "other", "low", None
+#                 )
+                
+#                 return jsonify({"status": "discussion_created"})
+        
+#         finally:
+#             if os.path.exists(temp_path):
+#                 os.remove(temp_path)
+#                 print("🗑️ Cleaned up temp file")
+    
+#     except Exception as e:
+#         print(f"❌ Error: {e}")
+#         import traceback
+#         traceback.print_exc()
+#         return jsonify({"error": str(e)}), 500
 
 
 
