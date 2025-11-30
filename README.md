@@ -47,6 +47,13 @@
 ![Copy of Superhack 2025 IDEA SUBMISSION pptx](https://github.com/user-attachments/assets/e4374214-cf6b-4b96-a041-bfeaa9110df5)
 
 
+## Use cases
+
+<img width="719" height="535" alt="image" src="https://github.com/user-attachments/assets/b69a172e-7762-455c-82ae-355266d09fb5" />
+<img width="1414" height="463" alt="image" src="https://github.com/user-attachments/assets/4c782285-677c-458a-af3d-59a4984c0782" />
+<img width="768" height="399" alt="image" src="https://github.com/user-attachments/assets/5daa3f1a-a1ae-480a-896e-34337c3608d0" />
+
+
 <!-- <img width="798" height="313" alt="final-removebg-preview" src="https://github.com/user-attachments/assets/43281ab7-810c-4605-a25e-203e178f2547" />
 
 <br>
