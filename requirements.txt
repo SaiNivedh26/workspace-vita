@@ -1,3 +1,6 @@
 zcatalyst-sdk
 flask
 qdrant-client>=1.9.0
+python-dotenv
+requests
+google-genai
