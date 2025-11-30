@@ -8,6 +8,15 @@ import json
 from datetime import datetime, timezone
 import uuid
 
+import tempfile
+import base64
+
+# Add to existing env vars
+BUCKET_URL = os.getenv("BUCKET_URL")  # Stratus bucket URL
+
+
+
+
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     VectorParams,
@@ -1163,6 +1172,230 @@ Summary:"""
         traceback.print_exc()
         return resolution_text
 
+
+
+
+# ========== ATTACHMENT HANDLING FUNCTIONS ==========
+
+def upload_to_stratus(local_path: str, object_key: str) -> str:
+    """Upload file to Stratus and return URL"""
+    try:
+        with open(local_path, "rb") as f:
+            file_content = f.read()
+        
+        url = f"{BUCKET_URL}/{object_key}"
+        headers = {
+            "Authorization": f"Zoho-oauthtoken {CATALYST_TOKEN}",
+            "compress": "false",
+            "cache-control": "max-age=3600"
+        }
+        
+        resp = requests.put(url, data=file_content, headers=headers, timeout=120)
+        print(f"Stratus upload: {resp.status_code}")
+        
+        if resp.status_code in [200, 201, 204]:
+            print(f"✓ Uploaded to Stratus: {object_key}")
+            return url
+        else:
+            print(f"✗ Upload failed: {resp.text[:200]}")
+            return None
+            
+    except Exception as e:
+        print(f"❌ Stratus upload error: {e}")
+        return None
+
+
+def process_image_with_vision(local_path: str) -> str:
+    """Analyze image using Qwen Vision model"""
+    try:
+        with open(local_path, "rb") as f:
+            b64img = base64.b64encode(f.read()).decode()
+        
+        url = f"https://api.catalyst.zoho.com/quickml/v1/project/{CATALYST_PROJECT_ID}/vlm/chat"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {CATALYST_TOKEN}",
+            "CATALYST-ORG": CATALYST_ORG_ID
+        }
+        
+        data = {
+            "prompt": "Analyze this image for IT incidents, errors, logs, or system issues. If you find any production problems, database issues, network errors, or service outages, describe them clearly. If it's just a casual image, say 'No incident detected'.",
+            "model": "VL-Qwen2.5-7B",
+            "images": [b64img],
+            "system_prompt": "You are an IT incident analyzer. Be concise and factual.",
+            "top_k": 50,
+            "top_p": 0.9,
+            "temperature": 0.7,
+            "max_tokens": 500
+        }
+        
+        resp = requests.post(url, json=data, headers=headers, timeout=90)
+        print(f"Vision model: {resp.status_code}")
+        
+        if resp.status_code == 200:
+            result = resp.json()
+            output = result.get("data", {}).get("output_text", "") or result.get("response", "")
+            print(f"Vision analysis: {output[:100]}...")
+            return output.strip()
+        else:
+            print(f"Vision error: {resp.text[:200]}")
+            return ""
+            
+    except Exception as e:
+        print(f"❌ Vision model error: {e}")
+        import traceback
+        traceback.print_exc()
+        return ""
+
+
+def ocr_document(local_path: str, filename: str) -> str:
+    """Run OCR on document/PDF and return extracted text"""
+    try:
+        url = f"https://api.catalyst.zoho.com/baas/v1/project/{CATALYST_PROJECT_ID}/ml/ocr"
+        headers = {
+            "Authorization": f"Zoho-oauthtoken {CATALYST_TOKEN}"
+        }
+        
+        with open(local_path, "rb") as f:
+            files = {"image": (filename, f)}
+            data = {"language": "eng"}
+            
+            resp = requests.post(url, headers=headers, files=files, data=data, timeout=120)
+        
+        print(f"OCR: {resp.status_code}")
+        
+        if resp.status_code == 200:
+            result = resp.json()
+            text_blocks = result.get("extracted_text", [])
+            text = " ".join(block.get("text", "") for block in text_blocks if block.get("text"))
+            print(f"OCR extracted {len(text)} characters")
+            return text
+        else:
+            print(f"OCR error: {resp.text[:200]}")
+            return ""
+            
+    except Exception as e:
+        print(f"❌ OCR error: {e}")
+        import traceback
+        traceback.print_exc()
+        return ""
+
+
+def process_attachment(attachment: dict, conversation_id: str, sender_id: str, timestamp_ms: int):
+    """Process single attachment: download, upload to Stratus, analyze"""
+    try:
+        att_url = attachment.get("url")
+        filename = attachment.get("name", f"attachment_{uuid.uuid4()}")
+        file_id = attachment.get("id", str(uuid.uuid4()))
+        
+        if not att_url:
+            print("⚠️ No attachment URL")
+            return
+        
+        print(f"📎 Processing attachment: {filename}")
+        
+        # Determine file extension
+        ext = filename.split(".")[-1].lower() if "." in filename else "bin"
+        
+        # Download to temp file
+        temp_path = tempfile.mktemp(suffix=f".{ext}")
+        
+        try:
+            # Stream download (handles large files)
+            print(f"⬇️ Downloading: {att_url[:50]}...")
+            resp = requests.get(att_url, stream=True, timeout=120)
+            
+            with open(temp_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=1024*1024):  # 1MB chunks
+                    if chunk:
+                        f.write(chunk)
+            
+            file_size = os.path.getsize(temp_path)
+            print(f"✓ Downloaded {file_size} bytes")
+            
+            # Upload to Stratus
+            stratus_key = f"attachments/{file_id}_{filename}"
+            stratus_url = upload_to_stratus(temp_path, stratus_key)
+            
+            if not stratus_url:
+                print("⚠️ Stratus upload failed, skipping analysis")
+                return
+            
+            # Process based on file type
+            if ext in ("png", "jpg", "jpeg", "bmp", "webp", "gif"):
+                # Image: Vision model
+                print("🖼️ Processing image with Vision model...")
+                analysis = process_image_with_vision(temp_path)
+                
+                if not analysis:
+                    analysis = "Image uploaded (analysis unavailable)"
+                
+                # Check if incident detected
+                analysis_lower = analysis.lower()
+                is_incident = any(keyword in analysis_lower for keyword in 
+                    ["error", "failed", "down", "outage", "critical", "production", 
+                     "database", "timeout", "crash", "exception"])
+                
+                if is_incident and "no incident" not in analysis_lower:
+                    # Create incident from image
+                    print(f"🚨 Incident detected in image!")
+                    message_text = f"[Image Analysis] {analysis}"
+                    index_message(conversation_id, f"img_{file_id}", sender_id, timestamp_ms, message_text)
+                else:
+                    # Discussion
+                    message_text = f"User shared image: {stratus_url}\n\nVision analysis: {analysis}"
+                    insert_message_into_datastore(
+                        conversation_id, f"img_{file_id}", sender_id, timestamp_ms,
+                        message_text, "discussion", "other", "low", None
+                    )
+                    print(f"💬 Image stored as discussion")
+            
+            elif ext in ("pdf", "doc", "docx", "txt"):
+                # Document: OCR
+                print(f"📄 Processing document with OCR...")
+                ocr_text = ocr_document(temp_path, filename)
+                
+                if not ocr_text:
+                    ocr_text = "Document uploaded (OCR failed)"
+                
+                # Summarize with LLM
+                summary_prompt = f"Summarize this document in 2-3 sentences: {ocr_text[:1000]}"
+                summary_resp = classify_message_llm(summary_prompt)
+                
+                summary = f"Document '{filename}' uploaded. Category: {summary_resp.get('category', 'other')}. Content: {ocr_text[:200]}..."
+                
+                # Always discussion for documents
+                message_text = f"User shared document: {stratus_url}\n\n{summary}"
+                insert_message_into_datastore(
+                    conversation_id, f"doc_{file_id}", sender_id, timestamp_ms,
+                    message_text, "discussion", summary_resp.get("category", "other"), 
+                    summary_resp.get("severity", "low"), None
+                )
+                print(f"📑 Document stored as discussion")
+            
+            else:
+                # Other files
+                message_text = f"User shared file: {filename} ({stratus_url})"
+                insert_message_into_datastore(
+                    conversation_id, f"file_{file_id}", sender_id, timestamp_ms,
+                    message_text, "discussion", "other", "low", None
+                )
+                print(f"📦 File stored as discussion")
+        
+        finally:
+            # Cleanup temp file
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+                print(f"🗑️ Cleaned up temp file")
+    
+    except Exception as e:
+        print(f"❌ Attachment processing error: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+
+
 # def summarize_resolution_with_llm(messages: list, current_resolution_text: str = None) -> str:
 #     """Generate resolution summary from linked messages + current resolution"""
 #     if not messages and not current_resolution_text:
@@ -2177,6 +2410,8 @@ def bot_events():
 
 
 # ========= Consumer: Signals → Indexing =========
+
+
 @app.route('/signals/consume', methods=['POST'])
 def signals_consume():
     payload = request.get_json()
@@ -2204,29 +2439,390 @@ def signals_consume():
     except Exception as e:
         return jsonify({"status": "parse_error"}), 200
     
-    try:
-        message_text = raw["message"]["content"]["text"]
-        message_id = raw["message"]["id"]
-        timestamp_ms = raw["time"]
-    except KeyError:
-        return jsonify({"status": "bad_raw"}), 200
-    
-    # Skip bot commands - check for bot mention in multiple formats
-    txt_lower = message_text.lower()
-    
-    # Skip if message contains bot mention (@workspace-vita or {@b-...})
-    if "@workspace-vita" in txt_lower or "{@b-" in message_text:
-        print(f"Skipping bot command from indexing: {message_text}")
-        return jsonify({"status": "command_skipped"}), 200
-    
+    # Get message details
+    message_obj = raw.get("message", {})
+    message_id = message_obj.get("id")
+    timestamp_ms = raw.get("time")
     sender_id = user.get("zoho_user_id") or user.get("id")
     conversation_id = chat.get("id")
     
-    print(f"📨 {message_text!r}")
+    # ✅ CHECK FOR ATTACHMENTS
+    attachments = message_obj.get("attachments", [])
+    if attachments:
+        print(f"📎 Found {len(attachments)} attachment(s)")
+        for att in attachments:
+            process_attachment(att, conversation_id, sender_id, timestamp_ms)
+        return jsonify({"status": "processed_attachments"})
+    
+    # Regular text message processing
+    try:
+        message_text = message_obj.get("content", {}).get("text", "")
+    except:
+        return jsonify({"status": "bad_raw"}), 200
+    
+    if not message_text:
+        return jsonify({"status": "no_text"}), 200
+    
+    # Skip bot commands
+    txt_lower = message_text.lower()
+    if "@workspace-vita" in txt_lower or "{@b-" in message_text:
+        print(f"Skipping bot command from indexing: {message_text[:50]}")
+        return jsonify({"status": "command_skipped"}), 200
+    
+    # Check if already indexed
+    qdrant_id = normalize_message_id(message_id)
+    try:
+        existing = qdrant.retrieve(
+            collection_name=QDRANT_COLLECTION,
+            ids=[qdrant_id]
+        )
+        if existing:
+            print(f"⚠️ Message {message_id} already indexed, skipping")
+            return jsonify({"status": "already_indexed"}), 200
+    except Exception:
+        pass
+    
+    print(f"📨 '{message_text}'")
     
     index_message(conversation_id, message_id, sender_id, timestamp_ms, message_text)
     
     return jsonify({"status": "processed"})
+
+@app.route('/process_attachment_cliq', methods=['POST'])
+def process_attachment_cliq():
+    """Process attachment from Cliq Participation Handler (URL-based)"""
+    try:
+        print("\n" + "="*60)
+        print("📎 CLIQ ATTACHMENT RECEIVED")
+        print("="*60)
+        
+        # Get parameters
+        file_url = request.form.get('file_url')
+        file_name = request.form.get('file_name', f'attachment_{uuid.uuid4()}')
+        conversation_id = request.form.get('conversation_id')
+        sender_id = request.form.get('sender_id')
+        timestamp_ms = int(request.form.get('timestamp', 0))
+        message_id = request.form.get('message_id')
+        
+        print(f"File: {file_name}")
+        print(f"URL: {file_url[:80]}...")
+        print(f"Conversation: {conversation_id}")
+        
+        if not file_url:
+            return jsonify({"error": "No file URL"}), 400
+        
+        # Download file from Cliq
+        ext = file_name.split(".")[-1].lower() if "." in file_name else "bin"
+        temp_path = tempfile.mktemp(suffix=f".{ext}")
+        
+        print(f"⬇️ Downloading from Cliq...")
+        resp = requests.get(file_url, stream=True, timeout=60)
+        
+        with open(temp_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=1024*1024):
+                if chunk:
+                    f.write(chunk)
+        
+        file_size = os.path.getsize(temp_path)
+        print(f"✓ Downloaded {file_size} bytes")
+        
+        try:
+            # Upload to Stratus
+            stratus_key = f"attachments/{message_id}_{file_name}"
+            stratus_url = upload_to_stratus(temp_path, stratus_key)
+            
+            if not stratus_url:
+                return jsonify({"error": "Stratus upload failed"}), 500
+            
+            print(f"✓ Uploaded to Stratus: {stratus_url}")
+            
+            # Process based on file type
+            if ext in ("png", "jpg", "jpeg", "bmp", "webp", "gif"):
+                print("🖼️ Processing image with Vision model...")
+                analysis = process_image_with_vision(temp_path)
+                
+                if not analysis:
+                    analysis = "Image uploaded (vision analysis unavailable)"
+                
+                print(f"Vision: {analysis[:100]}...")
+                
+                # Check for incident
+                analysis_lower = analysis.lower()
+                incident_keywords = ["error", "failed", "down", "outage", "critical", 
+                                    "production", "timeout", "crash", "exception", "database"]
+                
+                is_incident = any(kw in analysis_lower for kw in incident_keywords)
+                
+                if is_incident and "no incident" not in analysis_lower:
+                    print("🚨 INCIDENT DETECTED IN IMAGE!")
+                    message_text = f"[Image Analysis] {analysis}"
+                    index_message(conversation_id, f"img_{message_id}", sender_id, timestamp_ms, message_text)
+                    
+                    return jsonify({
+                        "status": "incident_created",
+                        "analysis": analysis,
+                        "stratus_url": stratus_url
+                    })
+                else:
+                    print("💬 Image stored as discussion")
+                    message_text = f"User shared image: {stratus_url}\n\nVision analysis: {analysis}"
+                    insert_message_into_datastore(
+                        conversation_id, f"img_{message_id}", sender_id, timestamp_ms,
+                        message_text, "discussion", "other", "low", None
+                    )
+                    
+                    return jsonify({
+                        "status": "discussion_created",
+                        "analysis": analysis
+                    })
+            
+            elif ext in ("pdf", "doc", "docx", "txt"):
+                print("📄 Processing document with OCR...")
+                ocr_text = ocr_document(temp_path, file_name)
+                
+                if ocr_text:
+                    summary = f"Document '{file_name}' contains: {ocr_text[:200]}..."
+                else:
+                    summary = f"Document '{file_name}' uploaded"
+                
+                message_text = f"User shared document: {stratus_url}\n\n{summary}"
+                insert_message_into_datastore(
+                    conversation_id, f"doc_{message_id}", sender_id, timestamp_ms,
+                    message_text, "discussion", "other", "low", None
+                )
+                
+                return jsonify({"status": "discussion_created", "summary": summary})
+            
+            else:
+                message_text = f"User shared file: {file_name} ({stratus_url})"
+                insert_message_into_datastore(
+                    conversation_id, f"file_{message_id}", sender_id, timestamp_ms,
+                    message_text, "discussion", "other", "low", None
+                )
+                
+                return jsonify({"status": "discussion_created"})
+        
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+                print("🗑️ Cleaned up temp file")
+    
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+
+
+@app.route('/process_attachment_upload', methods=['POST'])
+def process_attachment_upload():
+    """Receive attachment uploaded from Deluge Participation Handler"""
+    try:
+        print("\n" + "="*60)
+        print("📎 ATTACHMENT UPLOAD RECEIVED")
+        print("="*60)
+        
+        # Parse metadata from form
+        metadata_str = request.form.get('metadata', '{}')
+        print(f"Metadata string: {metadata_str}")
+        
+        # Parse metadata (Deluge sends as string)
+        try:
+            # Clean Deluge map format
+            metadata_str = metadata_str.replace("=", ":")
+            metadata = json.loads(metadata_str)
+        except:
+            # Fallback: try to parse manually
+            metadata = {}
+            for pair in metadata_str.split(","):
+                if "=" in pair:
+                    k, v = pair.split("=", 1)
+                    metadata[k.strip()] = v.strip()
+        
+        conversation_id = metadata.get('conversation_id', '')
+        sender_id = metadata.get('sender_id', '')
+        timestamp_ms = int(metadata.get('timestamp', 0))
+        message_id = metadata.get('message_id', '')
+        
+        print(f"Parsed: conv={conversation_id}, sender={sender_id}, ts={timestamp_ms}")
+        
+        # Get uploaded file (Deluge sends as 'file')
+        uploaded_file = None
+        for key in request.files:
+            print(f"Found file key: {key}")
+            uploaded_file = request.files[key]
+            break
+        
+        if not uploaded_file:
+            print("❌ No file found in request")
+            return jsonify({"error": "No file uploaded"}), 400
+        
+        filename = uploaded_file.filename or f"attachment_{uuid.uuid4()}"
+        print(f"📎 Processing: {filename}")
+        
+        # Save to temp file
+        ext = filename.split(".")[-1].lower() if "." in filename else "bin"
+        temp_path = tempfile.mktemp(suffix=f".{ext}")
+        uploaded_file.save(temp_path)
+        
+        try:
+            file_size = os.path.getsize(temp_path)
+            print(f"✓ Saved {file_size} bytes to {temp_path}")
+            
+            # Upload to Stratus
+            stratus_key = f"attachments/{message_id}_{filename}"
+            stratus_url = upload_to_stratus(temp_path, stratus_key)
+            
+            if not stratus_url:
+                print("❌ Stratus upload failed")
+                return jsonify({"error": "Stratus upload failed"}), 500
+            
+            print(f"✓ Uploaded to Stratus: {stratus_url}")
+            
+            # Process based on file type
+            if ext in ("png", "jpg", "jpeg", "bmp", "webp", "gif"):
+                print("🖼️ Processing image with Vision model...")
+                analysis = process_image_with_vision(temp_path)
+                
+                if not analysis:
+                    analysis = "Image uploaded (vision analysis unavailable)"
+                
+                print(f"Vision result: {analysis[:100]}...")
+                
+                # Check for incident keywords
+                analysis_lower = analysis.lower()
+                incident_keywords = ["error", "failed", "down", "outage", "critical", 
+                                    "production", "timeout", "crash", "exception", "database"]
+                
+                is_incident = any(kw in analysis_lower for kw in incident_keywords)
+                
+                if is_incident and "no incident" not in analysis_lower:
+                    print("🚨 Incident detected in image!")
+                    message_text = f"[Image Analysis] {analysis}"
+                    index_message(conversation_id, f"img_{message_id}", sender_id, timestamp_ms, message_text)
+                    
+                    return jsonify({
+                        "status": "incident_created",
+                        "analysis": analysis,
+                        "stratus_url": stratus_url
+                    })
+                else:
+                    print("💬 Image stored as discussion")
+                    message_text = f"User shared image: {stratus_url}\n\nVision analysis: {analysis}"
+                    insert_message_into_datastore(
+                        conversation_id, f"img_{message_id}", sender_id, timestamp_ms,
+                        message_text, "discussion", "other", "low", None
+                    )
+                    
+                    return jsonify({
+                        "status": "discussion_created",
+                        "analysis": analysis,
+                        "stratus_url": stratus_url
+                    })
+            
+            elif ext in ("pdf", "doc", "docx", "txt"):
+                print("📄 Processing document with OCR...")
+                ocr_text = ocr_document(temp_path, filename)
+                
+                if ocr_text:
+                    print(f"✓ OCR extracted {len(ocr_text)} characters")
+                    summary = f"Document '{filename}' contains: {ocr_text[:200]}..."
+                else:
+                    print("⚠️ OCR failed or empty")
+                    summary = f"Document '{filename}' uploaded (OCR unavailable)"
+                
+                message_text = f"User shared document: {stratus_url}\n\n{summary}"
+                insert_message_into_datastore(
+                    conversation_id, f"doc_{message_id}", sender_id, timestamp_ms,
+                    message_text, "discussion", "other", "low", None
+                )
+                
+                print("📑 Document stored as discussion")
+                
+                return jsonify({
+                    "status": "discussion_created",
+                    "summary": summary,
+                    "stratus_url": stratus_url
+                })
+            
+            else:
+                print(f"📦 Other file type: {ext}")
+                message_text = f"User shared file: {filename} ({stratus_url})"
+                insert_message_into_datastore(
+                    conversation_id, f"file_{message_id}", sender_id, timestamp_ms,
+                    message_text, "discussion", "other", "low", None
+                )
+                
+                return jsonify({
+                    "status": "discussion_created",
+                    "file_type": ext,
+                    "stratus_url": stratus_url
+                })
+        
+        finally:
+            # Cleanup
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+                print(f"🗑️ Cleaned up temp file")
+    
+    except Exception as e:
+        print(f"❌ Attachment processing error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+# @app.route('/signals/consume', methods=['POST'])
+# def signals_consume():
+#     payload = request.get_json()
+#     print("==== Signals delivered queued event ====")
+    
+#     events = payload.get("events", [])
+#     if not events:
+#         return jsonify({"status": "no_events"}), 200
+    
+#     event_obj = events[0]
+#     outer_data = event_obj.get("data", {})
+#     inner_data = outer_data.get("data", {})
+    
+#     raw_str = inner_data.get("raw")
+#     user_str = inner_data.get("user")
+#     chat_str = inner_data.get("chat")
+    
+#     if not (raw_str and user_str and chat_str):
+#         return jsonify({"status": "ignored"}), 200
+    
+#     try:
+#         raw = json.loads(raw_str)
+#         user = json.loads(user_str)
+#         chat = json.loads(chat_str)
+#     except Exception as e:
+#         return jsonify({"status": "parse_error"}), 200
+    
+#     try:
+#         message_text = raw["message"]["content"]["text"]
+#         message_id = raw["message"]["id"]
+#         timestamp_ms = raw["time"]
+#     except KeyError:
+#         return jsonify({"status": "bad_raw"}), 200
+    
+#     # Skip bot commands - check for bot mention in multiple formats
+#     txt_lower = message_text.lower()
+    
+#     # Skip if message contains bot mention (@workspace-vita or {@b-...})
+#     if "@workspace-vita" in txt_lower or "{@b-" in message_text:
+#         print(f"Skipping bot command from indexing: {message_text}")
+#         return jsonify({"status": "command_skipped"}), 200
+    
+#     sender_id = user.get("zoho_user_id") or user.get("id")
+#     conversation_id = chat.get("id")
+    
+#     print(f"📨 {message_text!r}")
+    
+#     index_message(conversation_id, message_id, sender_id, timestamp_ms, message_text)
+    
+#     return jsonify({"status": "processed"})
 
 
 # @app.route('/signals/consume', methods=['POST'])
