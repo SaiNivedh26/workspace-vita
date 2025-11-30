@@ -42,12 +42,26 @@
 <br>
 <br>
 
-## Architecture
 
-![Copy of Superhack 2025 IDEA SUBMISSION pptx](https://github.com/user-attachments/assets/e4374214-cf6b-4b96-a041-bfeaa9110df5)
+<img width="689" height="86" alt="image" src="https://github.com/user-attachments/assets/f943d093-9cbe-48ae-b8f9-331c5f8cbf3a" />
 
 
-## Use cases
+![zoho](https://github.com/user-attachments/assets/e4374214-cf6b-4b96-a041-bfeaa9110df5)
+
+
+<br>
+<br>
+
+<img width="1001" height="78" alt="image" src="https://github.com/user-attachments/assets/ed4b9a55-7472-4d9d-83dd-d6fc1a9c4def" />
+
+[![zoho](https://github.com/user-attachments/assets/e449d585-6156-4b3b-8867-81849678defd)](https://cliq.zoho.com/installapp.do?id=8123)
+
+
+<br>
+<br>
+
+<img width="691" height="73" alt="image" src="https://github.com/user-attachments/assets/79c56e79-f725-4847-b60f-8cea07d184ef" />
+
 
 <img width="719" height="535" alt="image" src="https://github.com/user-attachments/assets/b69a172e-7762-455c-82ae-355266d09fb5" />
 <img width="1414" height="463" alt="image" src="https://github.com/user-attachments/assets/4c782285-677c-458a-af3d-59a4984c0782" />
