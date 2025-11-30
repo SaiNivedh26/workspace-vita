@@ -38,6 +38,15 @@
 ![Zoho Catalyst](https://img.shields.io/badge/Zoho%20Serverless-1A53FF?style=for-the-badge&logo=zoho&logoColor=white)
 ![Zoho Cliq](https://img.shields.io/badge/Zoho%20Serverless-1A53FF?style=for-the-badge&logo=zoho&logoColor=white)
 
+
+<br>
+<br>
+
+## Architecture
+
+![Copy of Superhack 2025 IDEA SUBMISSION pptx](https://github.com/user-attachments/assets/e4374214-cf6b-4b96-a041-bfeaa9110df5)
+
+
 <!-- <img width="798" height="313" alt="final-removebg-preview" src="https://github.com/user-attachments/assets/43281ab7-810c-4605-a25e-203e178f2547" />
 
 <br>
