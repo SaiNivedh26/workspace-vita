@@ -35,8 +35,8 @@
 ![Zoho Startus](https://img.shields.io/badge/Zoho%20Stratus-1A53FF?style=for-the-badge&logo=zoho&logoColor=white)
 ![Zoho QuickML](https://img.shields.io/badge/Zoho%20QuickML-1A53FF?style=for-the-badge&logo=zoho&logoColor=white)
 ![Zoho Serverless](https://img.shields.io/badge/Zoho%20Serverless-1A53FF?style=for-the-badge&logo=zoho&logoColor=white)
-![Zoho Catalyst](https://img.shields.io/badge/Zoho%20Serverless-1A53FF?style=for-the-badge&logo=zoho&logoColor=white)
-![Zoho Cliq](https://img.shields.io/badge/Zoho%20Serverless-1A53FF?style=for-the-badge&logo=zoho&logoColor=white)
+![Zoho Catalyst](https://img.shields.io/badge/Zoho%20Catalyst-1A53FF?style=for-the-badge&logo=zoho&logoColor=white)
+![Zoho Cliq](https://img.shields.io/badge/Zoho%20Cliq-1A53FF?style=for-the-badge&logo=zoho&logoColor=white)
 
 
 <br>
