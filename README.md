@@ -42,6 +42,18 @@
 <br>
 <br>
 
+<h1 align="center">
+  <font size="7">THALA</font>
+</h1>
+  <p align="center">
+    Intelligent incident management system for automated detection, classification, and resolution tracking.
+    <br />
+    </p>
+</p>
+
+<br>
+<br>
+
 
 <img width="689" height="86" alt="image" src="https://github.com/user-attachments/assets/f943d093-9cbe-48ae-b8f9-331c5f8cbf3a" />
 
