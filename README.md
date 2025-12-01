@@ -119,8 +119,14 @@
   <img src="https://github.com/user-attachments/assets/94f9274b-9234-4c89-b99a-f2b3ed8599b0" width="5000" alt="santosh">
 </a>
 
+<br>
+<br>
 
+![Material wave loading](https://github.com/user-attachments/assets/a08255eb-9647-471d-9881-61871332249f)
 
+------
+
+### Developed with ❤️ by [Sai Nivedh](https://github.com/SaiNIvedh26) and [Hari Heman](https://github.com/HXMAN76)
 
 <!-- <img width="798" height="313" alt="final-removebg-preview" src="https://github.com/user-attachments/assets/43281ab7-810c-4605-a25e-203e178f2547" />
 
