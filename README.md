@@ -86,8 +86,15 @@
 <img width="693" height="360" alt="Copy_of_mohan-review__4___1_-removebg-preview" src="https://github.com/user-attachments/assets/748d29fe-29ad-4554-bfe9-831e1956aa4b" />
 
 [![mohan-review (1)](https://github.com/user-attachments/assets/df5aa107-0875-4cce-a81c-e3438848f9f9)](https://www.linkedin.com/in/mohan~v/)
-[![santosh](https://github.com/user-attachments/assets/cf7d08eb-993f-40af-93cd-aa9cd699cc17)](https://www.linkedin.com/in/santhosh-sachin/)
-[![pradeep](https://github.com/user-attachments/assets/cb605061-1088-4441-bea2-04aab5b9d645)](https://www.linkedin.com/in/pradeep-menon-perinchery/)
+
+<a href="https://www.linkedin.com/in/santhosh-sachin/">
+  <img src="https://github.com/user-attachments/assets/2093e71d-4156-4da7-b06d-7893083c11d7" width="5000" alt="santosh">
+</a>
+
+<a href="https://www.linkedin.com/in/pradeep-menon-perinchery/">
+  <img src="https://github.com/user-attachments/assets/94f9274b-9234-4c89-b99a-f2b3ed8599b0" width="5000" alt="santosh">
+</a>
+
 
 <!-- <img width="798" height="313" alt="final-removebg-preview" src="https://github.com/user-attachments/assets/43281ab7-810c-4605-a25e-203e178f2547" />
 
