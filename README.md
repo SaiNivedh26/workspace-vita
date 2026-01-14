@@ -42,6 +42,20 @@
 <br>
 <br>
 
+<br>
+
+<p align="center">
+  <img
+    src="https://github.com/user-attachments/assets/5d49bdc9-1b76-425e-ba68-c0e1229aba6b"
+    width="500"
+    height="500"
+    alt="Gemini Generated Image"
+  />
+</p>
+
+
+<br>
+
 <h1 align="center">
   <font size="7">Workspace Vita</font>
 </h1>
